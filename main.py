@@ -196,10 +196,10 @@ def main(page: ft.Page):
     page.add(ft.Column([
         api_key, secret,
         ft.Row([symbol, deposit, losses]),
-        ft.Row([ft.ElevatedButton("Запустить", on_click=on_start),
-                ft.ElevatedButton("Остановить", on_click=on_stop),
+        ft.Row([ft.FilledButton("Запустить", on_click=on_start),
+                ft.FilledButton("Остановить", on_click=on_stop),
                 status]),
         ft.Divider(), ft.Text("Журнал:"), log_view,
     ], expand=True))
 
-ft.app(main)
+ft.run(main)
