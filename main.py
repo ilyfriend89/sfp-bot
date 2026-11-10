@@ -43,11 +43,29 @@ BINGX_ALIASES = {
 }
 
 
-def round_step(qty, step):
-    """Округление количества вниз до шага инструмента."""
+def round_step(value, step):
+    """Округление вниз до шага (объём или цена)."""
     if not step or step <= 0:
-        return qty
-    return (int(qty / step + 1e-9)) * step
+        return value
+    return (int(value / step + 1e-9)) * step
+
+
+def qstr(x):
+    """Число строкой без хвостовых нулей и артефактов float."""
+    s = f"{x:.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def calc_3tp(entry, stop, side):
+    """Три тейка на равном расстоянии. Полная цель — 1.9R вместо прежних 2R.
+    Возвращает [tp1, tp2, tp3]."""
+    r = abs(entry - stop)
+    if r <= 0:
+        r = entry * 0.01
+    step = 1.9 * r / 3.0
+    if side == "LONG":
+        return [entry + step, entry + 2 * step, entry + 3 * step]
+    return [entry - step, entry - 2 * step, entry - 3 * step]
 
 
 class BybitAPI:
@@ -57,7 +75,7 @@ class BybitAPI:
         self.interval = interval
         self.aliases = BYBIT_ALIASES
         self.reverse = {v: k for k, v in BYBIT_ALIASES.items()}
-        self._lots = None  # кеш: symbol -> (minQty, step)
+        self._lots = None
 
     def sym(self, s):
         return self.aliases.get(s, s)
@@ -94,7 +112,7 @@ class BybitAPI:
         return d["result"]
 
     def _load_lots(self):
-        """Правила объёма по всем инструментам: minQty и шаг."""
+        """Правила инструментов: минимум объёма, шаг объёма, шаг цены."""
         if self._lots is not None:
             return self._lots
         try:
@@ -103,23 +121,29 @@ class BybitAPI:
             lots = {}
             for it in d.get("list", []):
                 f = it.get("lotSizeFilter", {})
-                lots[it["symbol"]] = (
-                    float(f.get("minOrderQty") or 0),
-                    float(f.get("qtyStep") or 0),
-                )
+                pf = it.get("priceFilter", {})
+                lots[it["symbol"]] = {
+                    "min": float(f.get("minOrderQty") or 0),
+                    "qstep": float(f.get("qtyStep") or 0),
+                    "tick": float(pf.get("tickSize") or 0),
+                }
             self._lots = lots
         except Exception:
             self._lots = {}
         return self._lots
 
     def qty_ok(self, symbol, qty, price=None):
-        """Проверка и нормализация количества под правила биржи."""
         info = self._load_lots().get(self.sym(symbol))
         if not info:
             return round(qty, 3)
-        min_q, step = info
-        qty = round_step(qty, step)
-        return qty if qty >= min_q else 0.0
+        qty = round_step(qty, info["qstep"])
+        return qty if qty >= info["min"] else 0.0
+
+    def price_ok(self, symbol, price):
+        info = self._load_lots().get(self.sym(symbol))
+        if not info or not info.get("tick"):
+            return round(price, 6)
+        return round_step(price, info["tick"])
 
     def candles(self, symbol, limit=30):
         d = self.req("GET", "/v5/market/kline",
@@ -185,18 +209,43 @@ class BybitAPI:
             pass
         return stop, tp
 
+    def open_reduce_orders(self, symbol):
+        """ID всех открытых reduce-only ордеров (стопы и тейки)."""
+        sym = self.sym(symbol)
+        out = []
+        for filt in ("StopOrder", "Order"):
+            try:
+                d = self.req("GET", "/v5/order/realtime",
+                             {"category": "linear", "symbol": sym,
+                              "openOnly": 0, "orderFilter": filt})
+                for o in d.get("list", []):
+                    if o.get("reduceOnly") and o.get("orderId"):
+                        out.append(o["orderId"])
+            except Exception:
+                pass
+        return out
+
+    def cancel(self, symbol, order_id):
+        try:
+            self.req("POST", "/v5/order/cancel",
+                     {"category": "linear", "symbol": self.sym(symbol),
+                      "orderId": order_id})
+            return True
+        except Exception:
+            return False
+
     def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
         p = {"category": "linear", "symbol": self.sym(symbol),
-             "side": side, "qty": str(qty), "positionIdx": 0}
+             "side": side, "qty": qstr(qty), "positionIdx": 0}
         if stop:
             p["orderType"] = "Market"
-            p["triggerPrice"] = str(stop)
+            p["triggerPrice"] = qstr(stop)
             p["triggerBy"] = "LastPrice"
             # Sell-стоп срабатывает ниже (LONG), Buy-стоп — выше (SHORT)
             p["triggerDirection"] = "Below" if side == "Sell" else "Above"
         elif tp:
             p["orderType"] = "Limit"
-            p["price"] = str(tp)
+            p["price"] = qstr(tp)
             p["timeInForce"] = "GTC"
         else:
             p["orderType"] = "Market"
@@ -255,8 +304,8 @@ class BingXAPI:
         return s
 
     def _load_lots(self):
-        """Правила объёма BingX: quantityPrecision — знаки после запятой,
-        поэтому шаг = 10^-precision. Плюс минимум в деньгах tradeMinUSDT."""
+        """quantityPrecision — знаки после запятой, шаг = 10^-precision.
+        Плюс шаг цены и минимум в деньгах tradeMinUSDT."""
         if self._lots is not None:
             return self._lots
         try:
@@ -265,13 +314,19 @@ class BingXAPI:
             for it in d or []:
                 sym = (it.get("symbol") or "").replace("-", "")
                 try:
-                    prec = int(it.get("quantityPrecision", 8))
-                    step = 10 ** (-prec) if prec > 0 else 1.0
+                    prec_q = int(it.get("quantityPrecision", 8))
                 except Exception:
-                    step = 0
-                min_q = float(it.get("tradeMinQuantity", 0) or 0)
-                min_usdt = float(it.get("tradeMinUSDT", 0) or 0)
-                lots[sym] = (min_q, step, min_usdt)
+                    prec_q = 8
+                try:
+                    prec_p = int(it.get("pricePrecision", 8))
+                except Exception:
+                    prec_p = 8
+                lots[sym] = {
+                    "min": float(it.get("tradeMinQuantity", 0) or 0),
+                    "qstep": 10 ** (-prec_q) if prec_q > 0 else 1.0,
+                    "tick": 10 ** (-prec_p) if prec_p > 0 else 0.0,
+                    "min_usdt": float(it.get("tradeMinUSDT", 0) or 0),
+                }
             self._lots = lots
         except Exception:
             self._lots = {}
@@ -281,13 +336,18 @@ class BingXAPI:
         info = self._load_lots().get(self.sym(symbol))
         if not info:
             return round(qty, 3)
-        min_q, step, min_usdt = info
-        qty = round_step(qty, step)
-        if qty < min_q:
+        qty = round_step(qty, info["qstep"])
+        if qty < info["min"]:
             return 0.0
-        if price and min_usdt and qty * price < min_usdt:
+        if price and info.get("min_usdt") and qty * price < info["min_usdt"]:
             return 0.0
         return qty
+
+    def price_ok(self, symbol, price):
+        info = self._load_lots().get(self.sym(symbol))
+        if not info or not info.get("tick"):
+            return round(price, 6)
+        return round_step(price, info["tick"])
 
     def candles(self, symbol, limit=30):
         d = self.req("GET", "/openApi/swap/v2/quote/kline",
@@ -346,18 +406,40 @@ class BingXAPI:
             pass
         return stop, tp
 
+    def open_reduce_orders(self, symbol):
+        out = []
+        try:
+            d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
+                         {"symbol": self.fmt(symbol)})
+            for o in d or []:
+                if o.get("reduceOnly") in (True, "true", 1):
+                    oid = o.get("orderId") or o.get("id")
+                    if oid:
+                        out.append(oid)
+        except Exception:
+            pass
+        return out
+
+    def cancel(self, symbol, order_id):
+        try:
+            self.req("POST", "/openApi/swap/v2/trade/cancelOrder",
+                     {"symbol": self.fmt(symbol), "orderId": str(order_id)})
+            return True
+        except Exception:
+            return False
+
     def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
         p = {"symbol": self.fmt(symbol),
              "side": "BUY" if side == "Buy" else "SELL",
              "positionSide": "ONE_WAY",
-             "qty": str(qty)}
+             "qty": qstr(qty)}
         if stop:
             p["type"] = "TRIGGER_MARKET"
-            p["stopPrice"] = str(stop)
+            p["stopPrice"] = qstr(stop)
             p["workingType"] = "MARK_PRICE"
         elif tp:
             p["type"] = "LIMIT"
-            p["price"] = str(tp)
+            p["price"] = qstr(tp)
             p["timeInForce"] = "GTC"
         else:
             p["type"] = "MARKET"
@@ -381,7 +463,7 @@ class Bot:
         self._load_state = load_state
         self._save_state = save_state
         self.stop_event = threading.Event()
-        self.rr = 2.0
+        self.total_rr = 1.9  # полная цель по тейкам: чуть меньше прежних 2R
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
@@ -407,6 +489,34 @@ class Bot:
         except Exception:
             pass
 
+    def place_stop(self, symbol, p, qty, stop_price):
+        """Ставит биржевой стоп-ордер, возвращает его ID или None."""
+        try:
+            res = self.api.order(symbol,
+                                 "Sell" if p["side"] == "LONG" else "Buy",
+                                 qty, stop=stop_price, reduce_only=True)
+            return res.get("orderId") if isinstance(res, dict) else None
+        except Exception as ex:
+            self.log(f"{symbol}: стоп-ордер не выставлен — {ex}. "
+                     f"Страховочное закрытие на стороне бота активно")
+            return None
+
+    def move_stop(self, symbol, p, new_stop, new_qty):
+        """Отменяет старый стоп и ставит новый на оставшийся объём."""
+        new_stop = self.api.price_ok(symbol, new_stop)
+        if p.get("stop_id"):
+            self.api.cancel(symbol, p["stop_id"])
+        p["stop_price"] = new_stop
+        p["stop_id"] = None
+        oid = self.place_stop(symbol, p, new_qty, new_stop)
+        p["stop_id"] = oid
+        if oid:
+            self.log(f"Стоп по {symbol} перенесён на {qstr(new_stop)} "
+                     f"(объём {qstr(new_qty)})")
+        else:
+            self.log(f"{symbol}: перенос стопа не удался — старый стоп "
+                     f"мог остаться, проверьте вручную")
+
     def recover(self):
         try:
             open_pos = self.api.open_positions()
@@ -414,14 +524,37 @@ class Bot:
             self.log(f"Не удалось получить открытые позиции: {ex}")
             return
         for sym, info in open_pos.items():
-            stop, tp = self.api.pending_exit_prices(sym)
-            self.positions[sym] = {"side": info["side"], "entry": info["entry"],
-                                   "stop": stop, "tp": tp, "qty": info["qty"]}
-            msg = (f"Восстановлена позиция {info['side']} {sym} "
-                   f"по {info['entry']}, объём {info['qty']}")
-            if stop is None or tp is None:
-                msg += " — стоп/тейк на бирже не найдены, проверьте вручную"
-            self.log(msg)
+            if sym not in self.symbols:
+                continue
+            side, entry, qty = info["side"], info["entry"], info["qty"]
+            stop, _ = self.api.pending_exit_prices(sym)
+            # снимаем старые стоп/тейк-ордера и перевыставляем по новой схеме
+            for oid in self.api.open_reduce_orders(sym):
+                self.api.cancel(sym, oid)
+            if not stop or stop == entry:
+                stop = entry - entry * 0.01 if side == "LONG" else entry + entry * 0.01
+                self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
+            stop = self.api.price_ok(sym, stop)
+            tps = [self.api.price_ok(sym, t) for t in calc_3tp(entry, stop, side)]
+            q1 = self.api.qty_ok(sym, qty / 3, price=entry)
+            q3 = self.api.qty_ok(sym, qty - 2 * q1, price=entry) if q1 > 0 else 0.0
+            self.positions[sym] = {
+                "side": side, "entry": entry, "stop_price": stop,
+                "stop_id": None, "tp_levels": tps,
+                "tp_filled": [False, False, False],
+                "qty_total": qty, "qty": qty,
+            }
+            self.positions[sym]["stop_id"] = self.place_stop(sym, self.positions[sym], qty, stop)
+            if q1 > 0 and q3 > 0:
+                for i, (q, tp) in enumerate(((q1, tps[0]), (q1, tps[1]), (q3, tps[2]))):
+                    try:
+                        self.api.order(sym, "Sell" if side == "LONG" else "Buy",
+                                       q, tp=tp, reduce_only=True)
+                    except Exception as ex:
+                        self.log(f"{sym}: тейк {i+1} не выставлен — {ex}")
+            self.log(f"Восстановлена позиция {side} {sym} по {qstr(entry)}, "
+                     f"объём {qstr(qty)}: стоп {qstr(stop)}, "
+                     f"тейки {qstr(tps[0])} / {qstr(tps[1])} / {qstr(tps[2])}")
         if open_pos:
             self.log(f"Итого восстановлено позиций: {len(open_pos)}")
         self.load_losses()
@@ -478,66 +611,78 @@ class Bot:
             self.day, self.losses_today = dt.date.today(), 0
             self.persist_losses()
 
-        open_pos = None
         try:
             open_pos = self.api.open_positions()
         except Exception as ex:
             self.log(f"Ошибка получения позиций: {ex}")
+            open_pos = None
 
-        if open_pos is not None:
-            for symbol in list(self.positions):
-                if symbol in open_pos:
-                    continue
-                p = self.positions[symbol]
+        for symbol in list(self.positions):
+            p = self.positions[symbol]
+            info = open_pos.get(symbol) if open_pos is not None else None
+
+            if info is None:
+                if open_pos is None:
+                    continue  # биржа не ответила — не считаем позицию закрытой
                 try:
                     cur = self.api.price(symbol)
                 except Exception:
                     cur = None
-                if cur is not None and p.get("stop") is not None and \
-                        ((p["side"] == "LONG" and cur <= p["stop"]) or
-                         (p["side"] == "SHORT" and cur >= p["stop"])):
+                if cur is not None and p["stop_price"] is not None and (
+                        (p["side"] == "LONG" and cur <= p["stop_price"]) or
+                        (p["side"] == "SHORT" and cur >= p["stop_price"])):
                     self.losses_today += 1
                     self.persist_losses()
                     self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
-                elif cur is not None and p.get("tp") is not None and \
-                        ((p["side"] == "LONG" and cur >= p["tp"]) or
-                         (p["side"] == "SHORT" and cur <= p["tp"])):
-                    self.log(f"ТЕЙК {symbol} достигнут (+2R)")
+                elif cur is not None and (
+                        (p["side"] == "LONG" and cur >= p["tp_levels"][2]) or
+                        (p["side"] == "SHORT" and cur <= p["tp_levels"][2])):
+                    self.log(f"Полный тейк по {symbol}: все 3 тейка отработаны")
                 else:
-                    self.log(f"{symbol}: позиция закрыта на бирже "
-                             f"(стоп или тейк сработали)")
+                    self.log(f"{symbol}: позиция закрыта на бирже")
                 del self.positions[symbol]
+                continue
 
-        for symbol in list(self.positions):
-            p = self.positions[symbol]
-            if p.get("stop") is None or p.get("tp") is None:
-                continue
-            try:
-                cur = self.api.price(symbol)
-            except Exception:
-                continue
-            hit_stop = (p["side"] == "LONG" and cur <= p["stop"]) or \
-                       (p["side"] == "SHORT" and cur >= p["stop"])
-            hit_tp = (p["side"] == "LONG" and cur >= p["tp"]) or \
-                     (p["side"] == "SHORT" and cur <= p["tp"])
-            if hit_stop or hit_tp:
-                still_open = (open_pos is None) or (symbol in open_pos)
-                if not still_open:
+            # сколько тейков сработало на бирже (по уменьшению объёма)
+            filled_now = int(round(
+                (p["qty_total"] - info["qty"]) / p["qty_total"] * 3))
+            filled_now = max(0, min(3, filled_now))
+            newly = filled_now - sum(p["tp_filled"])
+            if newly > 0:
+                for i in range(sum(p["tp_filled"]), filled_now):
+                    p["tp_filled"][i] = True
+                    self.log(f"ТЕЙК {i + 1}/3 по {symbol} достигнут "
+                             f"({qstr(p['tp_levels'][i])})")
+                    if i == 0:
+                        self.move_stop(symbol, p, p["entry"], info["qty"])
+                    elif i == 1:
+                        self.move_stop(symbol, p, p["tp_levels"][0], info["qty"])
+                if filled_now >= 3:
+                    self.log(f"{symbol}: все 3 тейка отработали, позиция закрыта")
+                    del self.positions[symbol]
                     continue
+            p["qty"] = info["qty"]
+
+            # страховочное закрытие, если биржевого стопа нет
+            if not p.get("stop_id"):
                 try:
-                    self.api.order(symbol,
-                                   "Sell" if p["side"] == "LONG" else "Buy",
-                                   p["qty"], reduce_only=True)
-                except Exception as ex:
-                    self.log(f"{symbol}: не удалось закрыть — {ex}")
-                    continue
-                if hit_stop:
-                    self.losses_today += 1
-                    self.persist_losses()
-                    self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
-                else:
-                    self.log(f"ТЕЙК {symbol} достигнут (+2R)")
-                del self.positions[symbol]
+                    cur = self.api.price(symbol)
+                except Exception:
+                    cur = None
+                if cur is not None and p["stop_price"] is not None and (
+                        (p["side"] == "LONG" and cur <= p["stop_price"]) or
+                        (p["side"] == "SHORT" and cur >= p["stop_price"])):
+                    try:
+                        self.api.order(symbol,
+                                       "Sell" if p["side"] == "LONG" else "Buy",
+                                       p["qty"], reduce_only=True)
+                        self.losses_today += 1
+                        self.persist_losses()
+                        self.log(f"СТОП по {symbol} (резервное закрытие). "
+                                 f"Стопов за день: {self.losses_today}")
+                        del self.positions[symbol]
+                    except Exception as ex:
+                        self.log(f"{symbol}: не удалось закрыть — {ex}")
 
         if self.losses_today >= self.max_losses:
             return
@@ -552,7 +697,7 @@ class Bot:
             if len(self.positions) >= self.max_positions:
                 break
             try:
-                side, stop = self.sfp_signal(symbol)
+                side, stop_lvl = self.sfp_signal(symbol)
             except Exception as ex:
                 self.log(f"{symbol}: ошибка запроса — {ex}")
                 continue
@@ -560,6 +705,7 @@ class Bot:
                 continue
 
             entry = self.api.price(symbol)
+            stop = self.api.price_ok(symbol, stop_lvl)
             raw_qty = self.api.balance() * self.deposit_pct / entry
             if raw_qty <= 0:
                 continue
@@ -567,8 +713,10 @@ class Bot:
             if qty <= 0:
                 self.log(f"{symbol}: объём {raw_qty:.6f} меньше минимума биржи — пропущено")
                 continue
-            risk = abs(entry - stop)
-            tp = entry + self.rr * risk if side == "LONG" else entry - self.rr * risk
+
+            tps = [self.api.price_ok(symbol, t) for t in calc_3tp(entry, stop, side)]
+            q1 = self.api.qty_ok(symbol, qty / 3, price=entry)
+            q3 = self.api.qty_ok(symbol, qty - 2 * q1, price=entry) if q1 > 0 else 0.0
 
             try:
                 self.api.order(symbol, "Buy" if side == "LONG" else "Sell", qty)
@@ -576,24 +724,32 @@ class Bot:
                 self.log(f"{symbol}: вход не прошёл — {ex}")
                 continue
 
-            self.positions[symbol] = {"side": side, "entry": entry,
-                                      "stop": stop, "tp": tp, "qty": qty}
-            self.log(f"ВХОД {side} {symbol} по {entry}, "
-                     f"стоп {stop:.4f}, тейк {tp:.4f} "
-                     f"[{len(self.positions)}/{self.max_positions}]")
+            self.positions[symbol] = {
+                "side": side, "entry": entry, "stop_price": stop,
+                "stop_id": None, "tp_levels": tps,
+                "tp_filled": [False, False, False],
+                "qty_total": qty, "qty": qty,
+            }
+            self.log(f"ВХОД {side} {symbol} по {qstr(entry)}, стоп {qstr(stop)}, "
+                     f"тейки: {qstr(tps[0])} / {qstr(tps[1])} / {qstr(tps[2])} "
+                     f"(по 1/3) [{len(self.positions)}/{self.max_positions}]")
 
-            try:
-                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
-                               qty, stop=round(stop, 6), reduce_only=True)
-            except Exception as ex:
-                self.log(f"{symbol}: стоп-ордер не выставлен — {ex}. "
-                         f"Закройте позицию вручную!")
-            try:
-                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
-                               qty, tp=round(tp, 6), reduce_only=True)
-            except Exception as ex:
-                self.log(f"{symbol}: тейк-ордер не выставлен — {ex}. "
-                         f"Позиция закроется только по стопу или вручную")
+            # биржевой стоп на весь объём
+            self.positions[symbol]["stop_id"] = \
+                self.place_stop(symbol, self.positions[symbol], qty, stop)
+
+            # три лимитных тейк-ордера по 1/3 объёма
+            if q1 > 0 and q3 > 0:
+                for i, (q, tp) in enumerate(((q1, tps[0]), (q1, tps[1]), (q3, tps[2]))):
+                    try:
+                        self.api.order(symbol,
+                                       "Sell" if side == "LONG" else "Buy",
+                                       q, tp=tp, reduce_only=True)
+                    except Exception as ex:
+                        self.log(f"{symbol}: тейк {i+1} не выставлен — {ex}")
+            else:
+                self.log(f"{symbol}: треть объёма ниже минимума биржи — "
+                         f"тейки не выставлены, сопровождение по стопу")
             break
 
 
@@ -678,8 +834,9 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
 
-    btn_start = ft.FilledButton("Запустить", expand=True)
-    btn_stop = ft.FilledButton("Остановить", expand=True, disabled=True)
+    btn_start = ft.FilledButton("Запустить", on_click=None, expand=True)
+    btn_stop = ft.FilledButton("Остановить", on_click=None, expand=True,
+                               disabled=True)
 
     def add_log(msg):
         log_view.controls.append(
