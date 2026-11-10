@@ -45,15 +45,12 @@ BINGX_ALIASES = {
 
 
 def round_step(value, step):
-    """Округление вниз до шага без float-артефактов."""
+    """Округление вниз до кратности шагу, без float-артефактов."""
     if not step or step <= 0:
         return value
     s = Decimal(str(step))
-    text = str(s)
-    dec = len(text.split(".")[-1].rstrip("0")) if "." in text else 0
-    q = (Decimal(str(value)) / s).quantize(Decimal(1).scaleb(-dec),
-                                           rounding=ROUND_DOWN)
-    return float(q)
+    n = (Decimal(str(value)) / s).to_integral_value(rounding=ROUND_DOWN)
+    return float(n * s)
 
 
 def qstr(x):
@@ -118,7 +115,8 @@ class BybitAPI:
         return d["result"]
 
     def _load_lots(self):
-        """Правила инструментов: минимум объёма, шаг объёма, шаг цены."""
+        """Правила инструментов: минимум объёма, шаг объёма, шаг цены,
+        максимум рыночного ордера."""
         if self._lots is not None:
             return self._lots
         try:
@@ -132,6 +130,7 @@ class BybitAPI:
                     "min": float(f.get("minOrderQty") or 0),
                     "qstep": float(f.get("qtyStep") or 0),
                     "tick": float(pf.get("tickSize") or 0),
+                    "max": float(f.get("maxMktOrderQty") or 0),
                 }
             self._lots = lots
         except Exception:
@@ -143,6 +142,8 @@ class BybitAPI:
         if not info:
             return round(qty, 3)
         qty = round_step(qty, info["qstep"])
+        if info.get("max") and qty > info["max"]:
+            qty = round_step(info["max"], info["qstep"])
         return qty if qty >= info["min"] else 0.0
 
     def price_ok(self, symbol, price):
@@ -775,7 +776,8 @@ def tg_send(cfg, text):
 
 def main(page: ft.Page):
     page.title = "SFP-бот"
-    page.padding = 16
+    # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
+    page.padding = ft.padding.only(left=16, right=16, top=48, bottom=16)
 
     def load_profiles():
         try:
@@ -967,7 +969,7 @@ def main(page: ft.Page):
     btn_start.on_click = on_start
     btn_stop.on_click = on_stop
 
-    page.add(ft.Column([
+    settings_tab = ft.Column([
         profile_dd,
         profile_name,
         ft.FilledButton("Сохранить настройки", on_click=on_save, expand=True),
@@ -987,10 +989,22 @@ def main(page: ft.Page):
         tg_token, tg_chat,
         moscow_note,
         ft.Row([btn_start, btn_stop]),
-        ft.OutlinedButton("Очистить журнал", on_click=on_clear_log, expand=True),
         status,
-        ft.Divider(), ft.Text("Журнал:"), log_view,
-    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
+    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
+
+    log_tab = ft.Column([
+        ft.OutlinedButton("Очистить журнал", on_click=on_clear_log, expand=True),
+        log_view,
+    ], spacing=10, expand=True)
+
+    page.add(ft.Tabs(
+        selected_index=0,
+        tabs=[
+            ft.Tab(text="Настройки бота", content=settings_tab),
+            ft.Tab(text="Журнал", content=log_tab),
+        ],
+        expand=True,
+    ))
 
     try:
         last = page.client_storage.get(LAST_KEY)
