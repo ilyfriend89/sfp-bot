@@ -19,6 +19,22 @@ TIMEFRAMES = {
     "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
 }
 
+# ---------- маппинг тикеров (псевдонимы -> реальные тикеры биржи) ----------
+# Для Bybit добавляем префикс 1000 к парам с низкой ценой, где 1 контракт = 1000 монет
+BYBIT_ALIASES = {
+    "PEPEUSDT": "1000PEPEUSDT",
+    "WIFUSDT": "WIFUSDT",      # на Bybit и так WIFUSDT, но для ясности
+    "PUMPUSDT": "1000PUMPUSDT",
+    "WLFIUSDT": "1000WLFIUSDT",
+}
+
+# Для BingX: обычно совпадает, но если будут отличия — сюда
+BINGX_ALIASES = {
+    "PEPEUSDT": "PEPEUSDT",
+    "PUMPUSDT": "PUMPUSDT",
+    "WLFIUSDT": "WLFIUSDT",
+}
+
 
 # ---------- API-адаптеры ----------
 
@@ -39,6 +55,12 @@ class BybitAPI:
                 "X-BAPI-SIGN": sign,
                 "Content-Type": "application/json"}
 
+    def _normalize_symbol(self, symbol):
+        # Приводим к верхнему регистру и убираем лишние символы
+        s = symbol.strip().replace("-", "").replace("/", "").upper()
+        # Применяем маппинг для Bybit
+        return BYBIT_ALIASES.get(s, s)
+
     def req(self, method, path, params=None):
         params = params or {}
         if method == "GET":
@@ -55,24 +77,26 @@ class BybitAPI:
         return d["result"]
 
     def candles(self, symbol, limit=30):
+        sym = self._normalize_symbol(symbol)
         d = self.req("GET", "/v5/market/kline",
-                     {"category": "linear", "symbol": symbol,
+                     {"category": "linear", "symbol": sym,
                       "interval": self.interval, "limit": limit})
-        rows = [(float(k[1]), float(k[2]), float(k[3]),
-                 float(k[4]), float(k[5])) for k in d["list"]]
+        rows = [(float(k), float(k), float(k),
+                 float(k), float(k)) for k in d["list"]]
         return list(reversed(rows))
 
     def price(self, symbol):
+        sym = self._normalize_symbol(symbol)
         d = self.req("GET", "/v5/market/tickers",
-                     {"category": "linear", "symbol": symbol})
-        return float(d["list"][0]["lastPrice"])
+                     {"category": "linear", "symbol": sym})
+        return float(d["list"]["lastPrice"])
 
     def balance(self):
         for acct in ("UNIFIED", "CONTRACT"):
             try:
                 d = self.req("GET", "/v5/account/wallet-balance",
                              {"accountType": acct})
-                for coin in d["list"][0]["coin"]:
+                for coin in d["list"]["coin"]:
                     if coin["coin"] == "USDT":
                         return float(coin["walletBalance"])
             except Exception:
@@ -80,7 +104,8 @@ class BybitAPI:
         return 0.0
 
     def order(self, symbol, side, qty, stop=None, reduce_only=False):
-        p = {"category": "linear", "symbol": symbol,
+        sym = self._normalize_symbol(symbol)
+        p = {"category": "linear", "symbol": sym,
              "side": side, "orderType": "Market",
              "qty": str(qty), "positionIdx": 0}
         if stop:
@@ -108,6 +133,17 @@ class BingXAPI:
                     "X-BX-SIGNATURE": sign,
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
+    def _normalize_symbol(self, symbol):
+        s = symbol.strip().replace("-", "").replace("/", "").upper()
+        return BINGX_ALIASES.get(s, s)
+
+    def fmt(self, symbol):
+        sym = self._normalize_symbol(symbol)
+        for q in ("USDT", "USDC", "BTC"):
+            if sym.endswith(q):
+                return sym[:-len(q)] + "-" + q
+        return sym
+
     def req(self, method, path, params=None):
         qs, headers = self._query(params or {})
         url = f"{self.base}{path}?{qs}"
@@ -118,25 +154,21 @@ class BingXAPI:
             raise RuntimeError(f"BingX: {d.get('msg')}")
         return d.get("data")
 
-    def fmt(self, symbol):
-        for q in ("USDT", "USDC", "BTC"):
-            if symbol.endswith(q):
-                return symbol[:-len(q)] + "-" + q
-        return symbol
-
     def candles(self, symbol, limit=30):
+        sym = self.fmt(symbol)
         d = self.req("GET", "/openApi/swap/v2/quote/kline",
-                     {"symbol": self.fmt(symbol), "interval": self.interval,
+                     {"symbol": sym, "interval": self.interval,
                       "limit": limit})
         rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
                  float(k["c"]), float(k["v"])) for k in d]
-        rows.sort(key=lambda x: x[0])
+        rows.sort(key=lambda x: x)
         return rows
 
     def price(self, symbol):
+        sym = self.fmt(symbol)
         d = self.req("GET", "/openApi/swap/v2/quote/ticker",
-                     {"symbol": self.fmt(symbol)})
-        return float(d[0]["lastPrice"])
+                     {"symbol": sym})
+        return float(d["lastPrice"])
 
     def balance(self):
         try:
@@ -149,7 +181,8 @@ class BingXAPI:
         return 0.0
 
     def order(self, symbol, side, qty, stop=None, reduce_only=False):
-        p = {"symbol": self.fmt(symbol),
+        sym = self.fmt(symbol)
+        p = {"symbol": sym,
              "side": "BUY" if side == "Buy" else "SELL",
              "positionSide": "ONE_WAY",
              "type": "MARKET", "qty": str(qty)}
@@ -182,27 +215,33 @@ class Bot:
         self.positions = {}
 
     def sfp_signal(self, symbol):
-        c = self.api.candles(symbol, limit=30)
+        try:
+            c = self.api.candles(symbol, limit=30)
+        except Exception as ex:
+            # Если тикер не существует — просто пропускаем
+            self.log(f"{symbol}: ошибка свечей — {ex}")
+            return None, None
+
         if len(c) < 22:
             return None, None
         prev, last = c[-2], c[-1]
-        avg_vol = sum(x[4] for x in c[-21:-1]) / 20
+        avg_vol = sum(x for x in c[-21:-1]) / 20
 
         now = dt.datetime.utcnow()
         kill_zone = (7 <= now.hour < 10) or (13 <= now.hour < 16)
 
-        long_sig = (last[2] < prev[2] and
-                    last[3] > prev[2] and
-                    last[4] > self.vol_mult * avg_vol and
+        long_sig = (last < prev and
+                    last > prev and
+                    last > self.vol_mult * avg_vol and
                     kill_zone)
-        short_sig = (last[1] > prev[1] and
-                     last[3] < prev[1] and
-                     last[4] > self.vol_mult * avg_vol and
+        short_sig = (last > prev and
+                     last < prev and
+                     last > self.vol_mult * avg_vol and
                      kill_zone)
         if long_sig:
-            return "LONG", last[2]
+            return "LONG", last
         if short_sig:
-            return "SHORT", last[1]
+            return "SHORT", last
         return None, None
 
     def run(self):
@@ -339,9 +378,7 @@ def main(page: ft.Page):
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
         label="Пары через запятую",
-        value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,LTCUSDT,"
-              "AVAXUSDT,TRXUSDT,DOTUSDT,POLUSDT,NEARUSDT,APTUSDT,ARBUSDT,"
-              "OPUSDT,SUIUSDT,JUPUSDT,FILUSDT,ATOMUSDT")
+        value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,ZECUSDT,HYPEUSDT,XPLUSDT,UNIUSDT,NEARUSDT,DOGEUSDT,ADAUSDT,LTCUSDT,LINKUSDT,AVAXUSDT,TRXUSDT,DOTUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,JUPUSDT,FILUSDT,ATOMUSDT,XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,WLFIUSDT,PUMPUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT")
     deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
     losses = ft.TextField(label="Макс. стопов в день", value="3")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
@@ -352,7 +389,7 @@ def main(page: ft.Page):
     profile_dd = ft.Dropdown(
         label="Сохранённые профили",
         options=[ft.dropdown.Option(k) for k in sorted(profiles)],
-        value=sorted(profiles)[0] if profiles else None)
+        value=sorted(profiles) if profiles else None)
 
     status = ft.Text("Остановлен", size=18, weight=ft.FontWeight.BOLD)
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
@@ -380,7 +417,7 @@ def main(page: ft.Page):
     def refresh_dd(selected=None):
         profile_dd.options = [ft.dropdown.Option(k) for k in sorted(profiles)]
         profile_dd.value = selected if selected in profiles else \
-            (sorted(profiles)[0] if profiles else None)
+            (sorted(profiles) if profiles else None)
         page.update()
 
     def on_save(e):
@@ -462,7 +499,6 @@ def main(page: ft.Page):
         status.value = "Остановлен"
         page.update()
 
-    # --- кнопки-полоски на всю ширину: ничего не выдавливается на узком экране ---
     page.add(ft.Column([
         profile_dd,
         profile_name,
@@ -486,16 +522,7 @@ def main(page: ft.Page):
             ft.FilledButton("Остановить", on_click=on_stop, expand=True),
         ]),
         status,
-        ft.Divider(), ft.Text("Журнал:"), log_view,
-    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
-
-    try:
-        last = page.client_storage.get(LAST_KEY)
-        if last and last in profiles:
-            apply(profiles[last])
-            refresh_dd(last)
-    except Exception:
-        pass
-
-
-ft.run(main)
+        ft.Divider(),
+        ft.Text("Журнал:", weight=ft.FontWeight.BOLD),
+        log_view,
+    ]))
