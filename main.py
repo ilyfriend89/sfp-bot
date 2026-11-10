@@ -997,14 +997,25 @@ def main(page: ft.Page):
         log_view,
     ], spacing=10, expand=True)
 
-    page.add(ft.Tabs(
-        selected_index=0,
-        tabs=[
-            ft.Tab(title="Настройки бота", content=settings_tab),
-            ft.Tab(title="Журнал", content=log_tab),
-        ],
-        expand=True,
-    ))
+    # переключение экранов двумя кнопками вместо вкладок — работает на любой версии флета
+    btn_tab_settings = ft.FilledButton("Настройки бота", expand=True)
+    btn_tab_log = ft.FilledButton("Журнал", expand=True)
+
+    content = ft.Column([settings_tab], spacing=10, expand=True)
+
+    def show_tab(idx):
+        btn_tab_settings.disabled = (idx == 0)
+        btn_tab_log.disabled = (idx == 1)
+        content.controls = [settings_tab] if idx == 0 else [log_tab]
+        page.update()
+
+    btn_tab_settings.on_click = lambda e: show_tab(0)
+    btn_tab_log.on_click = lambda e: show_tab(1)
+
+    page.add(ft.Column([
+        ft.Row([btn_tab_settings, btn_tab_log]),
+        content,
+    ], spacing=10, expand=True))
 
     try:
         last = page.client_storage.get(LAST_KEY)
