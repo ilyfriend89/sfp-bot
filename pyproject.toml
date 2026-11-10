@@ -9,4 +9,4 @@ dependencies = [
 
 [tool.flet]
 org = "com.sfpbot.app"
-product = "SFP Bot"
+product = "ByBing Bot"
