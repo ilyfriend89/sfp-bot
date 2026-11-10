@@ -8,16 +8,27 @@ BYBIT_DEMO = "https://api-testnet.bybit.com"
 BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
-STORAGE_KEY = "sfp_profiles"        # все сохранённые профили
-LAST_KEY = "sfp_last_profile"       # последний выбранный профиль
+STORAGE_KEY = "sfp_profiles"
+LAST_KEY = "sfp_last_profile"
+
+# ---------- конфигурация таймфреймов ----------
+# interval_* — код интервала для API каждой биржи
+# vol_mult   — множитель фильтра объёма (строже на младших ТФ)
+TIMEFRAMES = {
+    "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
+    "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
+    "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
+    "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
+}
 
 
 # ---------- API-адаптеры ----------
 
 class BybitAPI:
-    def __init__(self, api_key, secret, demo):
+    def __init__(self, api_key, secret, demo, interval):
         self.api_key, self.secret = api_key, secret
         self.base = BYBIT_DEMO if demo else BYBIT_REAL
+        self.interval = interval
 
     def _headers(self, payload):
         ts = str(int(time.time() * 1000))
@@ -48,7 +59,7 @@ class BybitAPI:
     def candles(self, symbol, limit=30):
         d = self.req("GET", "/v5/market/kline",
                      {"category": "linear", "symbol": symbol,
-                      "interval": "240", "limit": limit})
+                      "interval": self.interval, "limit": limit})
         rows = [(float(k[1]), float(k[2]), float(k[3]),
                  float(k[4]), float(k[5])) for k in d["list"]]
         return list(reversed(rows))
@@ -83,9 +94,10 @@ class BybitAPI:
 
 
 class BingXAPI:
-    def __init__(self, api_key, secret, demo):
+    def __init__(self, api_key, secret, demo, interval):
         self.api_key, self.secret = api_key, secret
         self.base = BINGX_DEMO if demo else BINGX_REAL
+        self.interval = interval
 
     def _query(self, params):
         p = dict(params)
@@ -108,19 +120,20 @@ class BingXAPI:
             raise RuntimeError(f"BingX: {d.get('msg')}")
         return d.get("data")
 
-    def candles(self, symbol, limit=30):
-        d = self.req("GET", "/openApi/swap/v2/quote/kline",
-                     {"symbol": self.fmt(symbol), "interval": "4h", "limit": limit})
-        rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
-                 float(k["c"]), float(k["v"])) for k in d]
-        rows.sort(key=lambda x: x[0])
-        return rows
-
-    def fmt(self, symbol):  # BTCUSDT -> BTC-USDT
+    def fmt(self, symbol):
         for q in ("USDT", "USDC", "BTC"):
             if symbol.endswith(q):
                 return symbol[:-len(q)] + "-" + q
         return symbol
+
+    def candles(self, symbol, limit=30):
+        d = self.req("GET", "/openApi/swap/v2/quote/kline",
+                     {"symbol": self.fmt(symbol), "interval": self.interval,
+                      "limit": limit})
+        rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
+                 float(k["c"]), float(k["v"])) for k in d]
+        rows.sort(key=lambda x: x[0])
+        return rows
 
     def price(self, symbol):
         d = self.req("GET", "/openApi/swap/v2/quote/ticker",
@@ -154,17 +167,18 @@ class BingXAPI:
 # ---------- торговое ядро ----------
 
 class Bot:
-    def __init__(self, api, symbols, deposit_pct,
+    def __init__(self, api, tf_label, symbols, deposit_pct,
                  max_losses_per_day, max_positions, log):
         self.api = api
+        self.tf_label = tf_label
+        self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
         self.symbols = symbols
         self.deposit_pct = deposit_pct
         self.max_losses = max_losses_per_day
         self.max_positions = max_positions
         self.log = log
         self.stop_event = threading.Event()
-        self.rr = 2.0
-        self.lev = 3
+        self.rr = 2.0                     # тейк = 2 × риск на любом ТФ
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
@@ -181,21 +195,22 @@ class Bot:
 
         long_sig = (last[2] < prev[2] and
                     last[3] > prev[2] and
-                    last[4] > 1.5 * avg_vol and
+                    last[4] > self.vol_mult * avg_vol and
                     kill_zone)
         short_sig = (last[1] > prev[1] and
                      last[3] < prev[1] and
-                     last[4] > 1.5 * avg_vol and
+                     last[4] > self.vol_mult * avg_vol and
                      kill_zone)
         if long_sig:
-            return "LONG", last[2]
+            return "LONG", last[2]      # стоп = минимум текущей свечи
         if short_sig:
-            return "SHORT", last[1]
+            return "SHORT", last[1]     # стоп = максимум текущей свечи
         return None, None
 
     def run(self):
-        self.log(f"Бот запущен ({self.api.base}). Пары: {', '.join(self.symbols)}. "
-                 f"Лимит позиций: {self.max_positions}")
+        self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
+                 f"(фильтр объёма ×{self.vol_mult}). "
+                 f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
         while not self.stop_event.is_set():
             try:
                 self.tick()
@@ -297,7 +312,6 @@ def main(page: ft.Page):
     page.title = "SFP-бот"
     page.padding = 16
 
-    # ---------- хранилище профилей ----------
     def load_profiles():
         try:
             return page.client_storage.get(STORAGE_KEY) or {}
@@ -310,9 +324,8 @@ def main(page: ft.Page):
         except Exception:
             pass
 
-    profiles = load_profiles()   # {имя: {поле: значение}}
+    profiles = load_profiles()
 
-    # ---------- поля ----------
     ex = ft.Dropdown(label="Биржа",
                      options=[ft.dropdown.Option("Bybit"),
                               ft.dropdown.Option("BingX")],
@@ -321,20 +334,23 @@ def main(page: ft.Page):
                        options=[ft.dropdown.Option("Демо"),
                                 ft.dropdown.Option("Реальный")],
                        value="Демо")
+    tf = ft.Dropdown(label="Таймфрейм",
+                     options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
+                     value="4 часа")
     api_key = ft.TextField(label="API-ключ", password=True, can_reveal_password=True)
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
         label="Пары через запятую",
         value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,LTCUSDT,"
-              "AVAXUSDT,TRXUSDT,DOTUSDT,MATICUSDT,NEARUSDT,APTUSDT,ARBUSDT,"
-              "OPUSDT,SUIUSDT,TONUSDT,FILUSDT,ATOMUSDT")
+              "AVAXUSDT,TRXUSDT,DOTUSDT,POLUSDT,NEARUSDT,APTUSDT,ARBUSDT,"
+              "OPUSDT,SUIUSDT,JUPUSDT,FILUSDT,ATOMUSDT")
     deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
     losses = ft.TextField(label="Макс. стопов в день", value="3")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
     tg_token = ft.TextField(label="Токен Telegram-бота", password=True, can_reveal_password=True)
     tg_chat = ft.TextField(label="Ваш chat_id в Telegram")
 
-    profile_name = ft.TextField(label="Имя профиля", hint_text="например: Bybit-демо")
+    profile_name = ft.TextField(label="Имя профиля", hint_text="например: Bybit-демо-4h")
     profile_dd = ft.Dropdown(
         label="Сохранённые профили",
         options=[ft.dropdown.Option(k) for k in sorted(profiles)],
@@ -350,10 +366,10 @@ def main(page: ft.Page):
         tg_send(cfg, msg)
         page.update()
 
-    # ---------- работа с профилями ----------
-    FIELDS = {"ex": ex, "mode": mode, "api_key": api_key, "secret": secret,
-              "symbols": symbols, "deposit": deposit, "losses": losses,
-              "maxpos": maxpos, "tg_token": tg_token, "tg_chat": tg_chat}
+    FIELDS = {"ex": ex, "mode": mode, "tf": tf, "api_key": api_key,
+              "secret": secret, "symbols": symbols, "deposit": deposit,
+              "losses": losses, "maxpos": maxpos,
+              "tg_token": tg_token, "tg_chat": tg_chat}
 
     def collect():
         return {k: (f.value or "") for k, f in FIELDS.items()}
@@ -402,11 +418,7 @@ def main(page: ft.Page):
         refresh_dd()
         add_log(f"Профиль «{name}» удалён")
 
-    def on_pick(e):
-        # мгновенная подгрузка при выборе из списка
-        on_load(None)
-
-    profile_dd.on_change = on_pick
+    profile_dd.on_change = on_load
 
     state = {"bot": None, "thread": None}
 
@@ -421,14 +433,20 @@ def main(page: ft.Page):
         if not api_key.value.strip() or not secret.value.strip():
             add_log("Введите API-ключ и секрет")
             return
+        tf_cfg = TIMEFRAMES.get(tf.value)
+        if not tf_cfg:
+            add_log("Выберите таймфрейм из списка")
+            return
         demo = mode.value == "Демо"
         if ex.value == "Bybit":
-            api = BybitAPI(api_key.value.strip(), secret.value.strip(), demo)
+            api = BybitAPI(api_key.value.strip(), secret.value.strip(),
+                           demo, tf_cfg["interval_bybit"])
         else:
-            api = BingXAPI(api_key.value.strip(), secret.value.strip(), demo)
+            api = BingXAPI(api_key.value.strip(), secret.value.strip(),
+                           demo, tf_cfg["interval_bingx"])
         try:
-            bot = Bot(api, pairs, float(deposit.value), int(losses.value),
-                      int(maxpos.value), add_log)
+            bot = Bot(api, tf.value, pairs, float(deposit.value),
+                      int(losses.value), int(maxpos.value), add_log)
         except ValueError:
             add_log("Проверьте числа в настройках")
             return
@@ -437,7 +455,7 @@ def main(page: ft.Page):
         state["bot"] = bot
         state["thread"] = threading.Thread(target=bot.run, daemon=True)
         state["thread"].start()
-        status.value = f"Работает: {ex.value} / {mode.value}"
+        status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
         page.update()
 
     def on_stop(e):
@@ -447,15 +465,13 @@ def main(page: ft.Page):
         page.update()
 
     page.add(ft.Column([
-        # --- профили ---
         profile_dd,
         ft.Row([profile_name,
                 ft.FilledButton("Сохранить", on_click=on_save)]),
         ft.Row([ft.FilledButton("Загрузить", on_click=on_load),
                 ft.OutlinedButton("Удалить", on_click=on_delete)]),
         ft.Divider(),
-        # --- настройки ---
-        ex, mode,
+        ex, mode, tf,
         api_key, secret,
         symbols,
         deposit, losses, maxpos,
@@ -466,7 +482,6 @@ def main(page: ft.Page):
         ft.Divider(), ft.Text("Журнал:"), log_view,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
 
-    # автозагрузка последнего профиля при старте приложения
     try:
         last = page.client_storage.get(LAST_KEY)
         if last and last in profiles:
