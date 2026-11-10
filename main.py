@@ -777,7 +777,7 @@ def tg_send(cfg, text):
 def main(page: ft.Page):
     page.title = "SFP-бот"
     # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
-    page.padding = ft.padding.only(left=16, right=16, top=48, bottom=16)
+    page.padding = 48
 
     def load_profiles():
         try:
