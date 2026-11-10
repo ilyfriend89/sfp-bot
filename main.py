@@ -1,5 +1,6 @@
 import time, hmac, hashlib, urllib.parse, threading, json
 import datetime as dt
+from decimal import Decimal, ROUND_DOWN
 import requests
 import flet as ft
 
@@ -44,15 +45,20 @@ BINGX_ALIASES = {
 
 
 def round_step(value, step):
-    """Округление вниз до шага (объём или цена)."""
+    """Округление вниз до шага без float-артефактов."""
     if not step or step <= 0:
         return value
-    return (int(value / step + 1e-9)) * step
+    s = Decimal(str(step))
+    text = str(s)
+    dec = len(text.split(".")[-1].rstrip("0")) if "." in text else 0
+    q = (Decimal(str(value)) / s).quantize(Decimal(1).scaleb(-dec),
+                                           rounding=ROUND_DOWN)
+    return float(q)
 
 
 def qstr(x):
     """Число строкой без хвостовых нулей и артефактов float."""
-    s = f"{x:.10f}".rstrip("0").rstrip(".")
+    s = f"{float(x):.10f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
 
@@ -241,8 +247,9 @@ class BybitAPI:
             p["orderType"] = "Market"
             p["triggerPrice"] = qstr(stop)
             p["triggerBy"] = "LastPrice"
-            # Sell-стоп срабатывает ниже (LONG), Buy-стоп — выше (SHORT)
-            p["triggerDirection"] = "Below" if side == "Sell" else "Above"
+            # Sell-стоп (закрытие LONG) срабатывает при падении — "2",
+            # Buy-стоп (закрытие SHORT) — при росте — "1"
+            p["triggerDirection"] = "2" if side == "Sell" else "1"
         elif tp:
             p["orderType"] = "Limit"
             p["price"] = qstr(tp)
