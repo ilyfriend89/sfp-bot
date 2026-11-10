@@ -43,6 +43,13 @@ BINGX_ALIASES = {
 }
 
 
+def round_step(qty, step):
+    """Округление количества вниз до шага инструмента."""
+    if not step or step <= 0:
+        return qty
+    return (int(qty / step + 1e-9)) * step
+
+
 class BybitAPI:
     def __init__(self, api_key, secret, demo, interval):
         self.api_key, self.secret = api_key, secret
@@ -50,6 +57,7 @@ class BybitAPI:
         self.interval = interval
         self.aliases = BYBIT_ALIASES
         self.reverse = {v: k for k, v in BYBIT_ALIASES.items()}
+        self._lots = None  # кеш: symbol -> (minQty, step)
 
     def sym(self, s):
         return self.aliases.get(s, s)
@@ -84,6 +92,34 @@ class BybitAPI:
         if d.get("retCode") != 0:
             raise RuntimeError(f"Bybit: {d.get('retMsg')}")
         return d["result"]
+
+    def _load_lots(self):
+        """Правила объёма по всем инструментам: minQty и шаг."""
+        if self._lots is not None:
+            return self._lots
+        try:
+            d = self.req("GET", "/v5/market/instruments-info",
+                         {"category": "linear"})
+            lots = {}
+            for it in d.get("list", []):
+                f = it.get("lotSizeFilter", {})
+                lots[it["symbol"]] = (
+                    float(f.get("minOrderQty") or 0),
+                    float(f.get("qtyStep") or 0),
+                )
+            self._lots = lots
+        except Exception:
+            self._lots = {}
+        return self._lots
+
+    def qty_ok(self, symbol, qty, price=None):
+        """Проверка и нормализация количества под правила биржи."""
+        info = self._load_lots().get(self.sym(symbol))
+        if not info:
+            return round(qty, 3)
+        min_q, step = info
+        qty = round_step(qty, step)
+        return qty if qty >= min_q else 0.0
 
     def candles(self, symbol, limit=30):
         d = self.req("GET", "/v5/market/kline",
@@ -156,6 +192,8 @@ class BybitAPI:
             p["orderType"] = "Market"
             p["triggerPrice"] = str(stop)
             p["triggerBy"] = "LastPrice"
+            # Sell-стоп срабатывает ниже (LONG), Buy-стоп — выше (SHORT)
+            p["triggerDirection"] = "Below" if side == "Sell" else "Above"
         elif tp:
             p["orderType"] = "Limit"
             p["price"] = str(tp)
@@ -174,6 +212,7 @@ class BingXAPI:
         self.interval = interval
         self.aliases = BINGX_ALIASES
         self.reverse = {v: k for k, v in BINGX_ALIASES.items()}
+        self._lots = None
 
     def sym(self, s):
         return self.aliases.get(s, s)
@@ -214,6 +253,41 @@ class BingXAPI:
             if s.endswith(q):
                 return s[:-len(q)] + "-" + q
         return s
+
+    def _load_lots(self):
+        """Правила объёма BingX: quantityPrecision — знаки после запятой,
+        поэтому шаг = 10^-precision. Плюс минимум в деньгах tradeMinUSDT."""
+        if self._lots is not None:
+            return self._lots
+        try:
+            d = self.req("GET", "/openApi/swap/v2/quote/contracts", {})
+            lots = {}
+            for it in d or []:
+                sym = (it.get("symbol") or "").replace("-", "")
+                try:
+                    prec = int(it.get("quantityPrecision", 8))
+                    step = 10 ** (-prec) if prec > 0 else 1.0
+                except Exception:
+                    step = 0
+                min_q = float(it.get("tradeMinQuantity", 0) or 0)
+                min_usdt = float(it.get("tradeMinUSDT", 0) or 0)
+                lots[sym] = (min_q, step, min_usdt)
+            self._lots = lots
+        except Exception:
+            self._lots = {}
+        return self._lots
+
+    def qty_ok(self, symbol, qty, price=None):
+        info = self._load_lots().get(self.sym(symbol))
+        if not info:
+            return round(qty, 3)
+        min_q, step, min_usdt = info
+        qty = round_step(qty, step)
+        if qty < min_q:
+            return 0.0
+        if price and min_usdt and qty * price < min_usdt:
+            return 0.0
+        return qty
 
     def candles(self, symbol, limit=30):
         d = self.req("GET", "/openApi/swap/v2/quote/kline",
@@ -486,8 +560,12 @@ class Bot:
                 continue
 
             entry = self.api.price(symbol)
-            qty = round(self.api.balance() * self.deposit_pct / entry, 3)
+            raw_qty = self.api.balance() * self.deposit_pct / entry
+            if raw_qty <= 0:
+                continue
+            qty = self.api.qty_ok(symbol, raw_qty, price=entry)
             if qty <= 0:
+                self.log(f"{symbol}: объём {raw_qty:.6f} меньше минимума биржи — пропущено")
                 continue
             risk = abs(entry - stop)
             tp = entry + self.rr * risk if side == "LONG" else entry - self.rr * risk
@@ -582,8 +660,7 @@ def main(page: ft.Page):
               "DOTUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,JUPUSDT,FILUSDT,ATOMUSDT,"
               "XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,"
               "ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,"
-              "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,WLFIUSDT,PUMPUSDT,"
-              "ASTERUSDT,NIGHTUSDT,ENAUSDT")
+              "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT")
     deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
     losses = ft.TextField(label="Макс. стопов в день", value="3")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
@@ -601,10 +678,19 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
 
+    btn_start = ft.FilledButton("Запустить", expand=True)
+    btn_stop = ft.FilledButton("Остановить", expand=True, disabled=True)
+
     def add_log(msg):
         log_view.controls.append(
             ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
         tg_send(cfg, msg)
+        page.update()
+
+    def on_clear_log(e):
+        log_view.controls.clear()
+        log_view.controls.append(
+            ft.Text(f"{dt.datetime.now():%H:%M:%S}  Журнал очищен (бот продолжает работать)"))
         page.update()
 
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "api_key": api_key,
@@ -663,6 +749,11 @@ def main(page: ft.Page):
 
     state = {"bot": None, "thread": None, "active": False}
 
+    def set_buttons(running):
+        btn_start.disabled = running
+        btn_stop.disabled = not running
+        page.update()
+
     def on_start(e):
         if state["active"]:
             add_log("Бот уже работает — сначала нажмите Остановить")
@@ -700,14 +791,17 @@ def main(page: ft.Page):
         state["thread"] = threading.Thread(target=bot.run, daemon=True)
         state["thread"].start()
         status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
-        page.update()
+        set_buttons(True)
 
     def on_stop(e):
         if state["bot"]:
             state["bot"].stop_event.set()
         state["active"] = False
         status.value = "Остановлен"
-        page.update()
+        set_buttons(False)
+
+    btn_start.on_click = on_start
+    btn_stop.on_click = on_stop
 
     page.add(ft.Column([
         profile_dd,
@@ -728,10 +822,8 @@ def main(page: ft.Page):
         ft.Container(maxpos, expand=1),
         tg_token, tg_chat,
         moscow_note,
-        ft.Row([
-            ft.FilledButton("Запустить", on_click=on_start, expand=True),
-            ft.FilledButton("Остановить", on_click=on_stop, expand=True),
-        ]),
+        ft.Row([btn_start, btn_stop]),
+        ft.OutlinedButton("Очистить журнал", on_click=on_clear_log, expand=True),
         status,
         ft.Divider(), ft.Text("Журнал:"), log_view,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
