@@ -1000,8 +1000,8 @@ def main(page: ft.Page):
     page.add(ft.Tabs(
         selected_index=0,
         tabs=[
-            ft.Tab(text="Настройки бота", content=settings_tab),
-            ft.Tab(text="Журнал", content=log_tab),
+            ft.Tab(title="Настройки бота", content=settings_tab),
+            ft.Tab(title="Журнал", content=log_tab),
         ],
         expand=True,
     ))
