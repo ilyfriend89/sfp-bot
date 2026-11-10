@@ -10,6 +10,10 @@ BINGX_DEMO = "https://open-api-vst.bingx.com"
 
 STORAGE_KEY = "sfp_profiles"
 LAST_KEY = "sfp_last_profile"
+LOSSES_KEY = "sfp_losses_state"
+
+MOSCOW_HINT = ("⏰ По Москве: кил-зоны 10:00–13:00 и 16:00–19:00. "
+               "Бот включайте с 9:30 до 19:00 по МСК, в остальное время сигналов не будет.")
 
 # ---------- конфигурация таймфреймов ----------
 TIMEFRAMES = {
@@ -19,20 +23,25 @@ TIMEFRAMES = {
     "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
 }
 
-# ---------- маппинг тикеров (псевдонимы -> реальные тикеры биржи) ----------
-# Для Bybit добавляем префикс 1000 к парам с низкой ценой, где 1 контракт = 1000 монет
+# ---------- псевдонимы тикеров (универсальное имя -> тикер биржи) ----------
 BYBIT_ALIASES = {
-    "PEPEUSDT": "1000PEPEUSDT",
-    "WIFUSDT": "WIFUSDT",      # на Bybit и так WIFUSDT, но для ясности
-    "PUMPUSDT": "1000PUMPUSDT",
-    "WLFIUSDT": "1000WLFIUSDT",
+    "PEPEUSDT":  "1000PEPEUSDT",
+    "BONKUSDT":  "1000BONKUSDT",
+    "FLOKIUSDT": "1000FLOKIUSDT",
+    "SHIBUSDT":  "1000SHIBUSDT",
+    "PUMPUSDT":  "1000PUMPUSDT",
+    "WLFIUSDT":  "1000WLFIUSDT",
+    "WIFUSDT":   "WIFUSDT",
 }
 
-# Для BingX: обычно совпадает, но если будут отличия — сюда
 BINGX_ALIASES = {
-    "PEPEUSDT": "PEPEUSDT",
-    "PUMPUSDT": "PUMPUSDT",
-    "WLFIUSDT": "WLFIUSDT",
+    "PEPEUSDT":  "PEPEUSDT",
+    "BONKUSDT":  "BONKUSDT",
+    "FLOKIUSDT": "FLOKIUSDT",
+    "SHIBUSDT":  "SHIBUSDT",
+    "PUMPUSDT":  "PUMPUSDT",
+    "WLFIUSDT":  "WLFIUSDT",
+    "WIFUSDT":   "WIFUSDT",
 }
 
 
@@ -43,6 +52,14 @@ class BybitAPI:
         self.api_key, self.secret = api_key, secret
         self.base = BYBIT_DEMO if demo else BYBIT_REAL
         self.interval = interval
+        self.aliases = BYBIT_ALIASES
+        self.reverse = {v: k for k, v in BYBIT_ALIASES.items()}
+
+    def sym(self, s):
+        return self.aliases.get(s, s)
+
+    def to_universal(self, s):
+        return self.reverse.get(s, s)
 
     def _headers(self, payload):
         ts = str(int(time.time() * 1000))
@@ -54,12 +71,6 @@ class BybitAPI:
                 "X-BAPI-RECV-WINDOW": "5000",
                 "X-BAPI-SIGN": sign,
                 "Content-Type": "application/json"}
-
-    def _normalize_symbol(self, symbol):
-        # Приводим к верхнему регистру и убираем лишние символы
-        s = symbol.strip().replace("-", "").replace("/", "").upper()
-        # Применяем маппинг для Bybit
-        return BYBIT_ALIASES.get(s, s)
 
     def req(self, method, path, params=None):
         params = params or {}
@@ -77,40 +88,83 @@ class BybitAPI:
         return d["result"]
 
     def candles(self, symbol, limit=30):
-        sym = self._normalize_symbol(symbol)
         d = self.req("GET", "/v5/market/kline",
-                     {"category": "linear", "symbol": sym,
+                     {"category": "linear", "symbol": self.sym(symbol),
                       "interval": self.interval, "limit": limit})
-        rows = [(float(k), float(k), float(k),
-                 float(k), float(k)) for k in d["list"]]
+        rows = [(float(k[1]), float(k[2]), float(k[3]),
+                 float(k[4]), float(k[5])) for k in d["list"]]
         return list(reversed(rows))
 
     def price(self, symbol):
-        sym = self._normalize_symbol(symbol)
         d = self.req("GET", "/v5/market/tickers",
-                     {"category": "linear", "symbol": sym})
-        return float(d["list"]["lastPrice"])
+                     {"category": "linear", "symbol": self.sym(symbol)})
+        return float(d["list"][0]["lastPrice"])
 
     def balance(self):
         for acct in ("UNIFIED", "CONTRACT"):
             try:
                 d = self.req("GET", "/v5/account/wallet-balance",
                              {"accountType": acct})
-                for coin in d["list"]["coin"]:
+                for coin in d["list"][0]["coin"]:
                     if coin["coin"] == "USDT":
                         return float(coin["walletBalance"])
             except Exception:
                 continue
         return 0.0
 
-    def order(self, symbol, side, qty, stop=None, reduce_only=False):
-        sym = self._normalize_symbol(symbol)
-        p = {"category": "linear", "symbol": sym,
-             "side": side, "orderType": "Market",
-             "qty": str(qty), "positionIdx": 0}
+    def open_positions(self):
+        d = self.req("GET", "/v5/position/list",
+                     {"category": "linear", "settleCoin": "USDT"})
+        out = {}
+        for p in d.get("list", []):
+            if float(p.get("size", 0)) == 0:
+                continue
+            out[self.to_universal(p["symbol"])] = {
+                "side": "LONG" if p["side"] == "Buy" else "SHORT",
+                "qty": float(p["size"]),
+                "entry": float(p["avgPrice"]),
+            }
+        return out
+
+    def pending_exit_prices(self, symbol):
+        """Восстановление стопа/тейка с биржевых ордеров."""
+        sym = self.sym(symbol)
+        stop = tp = None
+        try:
+            d = self.req("GET", "/v5/order/realtime",
+                         {"category": "linear", "symbol": sym,
+                          "openOnly": 0, "orderFilter": "StopOrder"})
+            for o in d.get("list", []):
+                if o.get("reduceOnly") and o.get("triggerPrice"):
+                    stop = float(o["triggerPrice"])
+                    break
+        except Exception:
+            pass
+        try:
+            d = self.req("GET", "/v5/order/realtime",
+                         {"category": "linear", "symbol": sym,
+                          "openOnly": 0, "orderFilter": "Order"})
+            for o in d.get("list", []):
+                if o.get("reduceOnly") and o.get("orderType") == "Limit":
+                    tp = float(o["price"])
+                    break
+        except Exception:
+            pass
+        return stop, tp
+
+    def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
+        p = {"category": "linear", "symbol": self.sym(symbol),
+             "side": side, "qty": str(qty), "positionIdx": 0}
         if stop:
+            p["orderType"] = "Market"
             p["triggerPrice"] = str(stop)
             p["triggerBy"] = "LastPrice"
+        elif tp:
+            p["orderType"] = "Limit"
+            p["price"] = str(tp)
+            p["timeInForce"] = "GTC"
+        else:
+            p["orderType"] = "Market"
         if reduce_only:
             p["reduceOnly"] = True
         return self.req("POST", "/v5/order/create", p)
@@ -121,6 +175,18 @@ class BingXAPI:
         self.api_key, self.secret = api_key, secret
         self.base = BINGX_DEMO if demo else BINGX_REAL
         self.interval = interval
+        self.aliases = BINGX_ALIASES
+        self.reverse = {v: k for k, v in BINGX_ALIASES.items()}
+
+    def sym(self, s):
+        return self.aliases.get(s, s)
+
+    def to_universal(self, s):
+        s = self.reverse.get(s, s)
+        for q in ("USDT", "USDC", "BTC"):
+            if s.endswith(q):
+                return s[:-len(q)] + q
+        return s
 
     def _query(self, params):
         p = dict(params)
@@ -133,17 +199,6 @@ class BingXAPI:
                     "X-BX-SIGNATURE": sign,
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
-    def _normalize_symbol(self, symbol):
-        s = symbol.strip().replace("-", "").replace("/", "").upper()
-        return BINGX_ALIASES.get(s, s)
-
-    def fmt(self, symbol):
-        sym = self._normalize_symbol(symbol)
-        for q in ("USDT", "USDC", "BTC"):
-            if sym.endswith(q):
-                return sym[:-len(q)] + "-" + q
-        return sym
-
     def req(self, method, path, params=None):
         qs, headers = self._query(params or {})
         url = f"{self.base}{path}?{qs}"
@@ -154,21 +209,26 @@ class BingXAPI:
             raise RuntimeError(f"BingX: {d.get('msg')}")
         return d.get("data")
 
+    def fmt(self, symbol):
+        s = self.sym(symbol)
+        for q in ("USDT", "USDC", "BTC"):
+            if s.endswith(q):
+                return s[:-len(q)] + "-" + q
+        return s
+
     def candles(self, symbol, limit=30):
-        sym = self.fmt(symbol)
         d = self.req("GET", "/openApi/swap/v2/quote/kline",
-                     {"symbol": sym, "interval": self.interval,
+                     {"symbol": self.fmt(symbol), "interval": self.interval,
                       "limit": limit})
         rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
                  float(k["c"]), float(k["v"])) for k in d]
-        rows.sort(key=lambda x: x)
+        rows.sort(key=lambda x: x[0])
         return rows
 
     def price(self, symbol):
-        sym = self.fmt(symbol)
         d = self.req("GET", "/openApi/swap/v2/quote/ticker",
-                     {"symbol": sym})
-        return float(d["lastPrice"])
+                     {"symbol": self.fmt(symbol)})
+        return float(d[0]["lastPrice"])
 
     def balance(self):
         try:
@@ -180,16 +240,54 @@ class BingXAPI:
             pass
         return 0.0
 
-    def order(self, symbol, side, qty, stop=None, reduce_only=False):
+    def open_positions(self):
+        try:
+            d = self.req("GET", "/openApi/swap/v2/user/positions", {})
+        except Exception:
+            return {}
+        out = {}
+        for p in d or []:
+            amt = abs(float(p.get("positionAmt", 0) or 0))
+            if amt == 0:
+                continue
+            out[self.to_universal(p["symbol"])] = {
+                "side": p.get("side", "LONG").upper(),
+                "qty": amt,
+                "entry": float(p.get("avgPrice", 0) or 0),
+            }
+        return out
+
+    def pending_exit_prices(self, symbol):
         sym = self.fmt(symbol)
-        p = {"symbol": sym,
+        stop = tp = None
+        try:
+            d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
+                         {"symbol": sym})
+            for o in d or []:
+                if o.get("reduceOnly") in (True, "true", 1):
+                    if o.get("type") == "TRIGGER_MARKET" and o.get("stopPrice"):
+                        stop = float(o["stopPrice"])
+                    elif o.get("type") == "LIMIT" and o.get("price"):
+                        tp = float(o["price"])
+        except Exception:
+            pass
+        return stop, tp
+
+    def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
+        p = {"symbol": self.fmt(symbol),
              "side": "BUY" if side == "Buy" else "SELL",
              "positionSide": "ONE_WAY",
-             "type": "MARKET", "qty": str(qty)}
+             "qty": str(qty)}
         if stop:
             p["type"] = "TRIGGER_MARKET"
             p["stopPrice"] = str(stop)
             p["workingType"] = "MARK_PRICE"
+        elif tp:
+            p["type"] = "LIMIT"
+            p["price"] = str(tp)
+            p["timeInForce"] = "GTC"
+        else:
+            p["type"] = "MARKET"
         if reduce_only:
             p["reduceOnly"] = True
         return self.req("POST", "/openApi/swap/v2/trade/order", p)
@@ -199,7 +297,8 @@ class BingXAPI:
 
 class Bot:
     def __init__(self, api, tf_label, symbols, deposit_pct,
-                 max_losses_per_day, max_positions, log):
+                 max_losses_per_day, max_positions, log,
+                 load_state=None, save_state=None):
         self.api = api
         self.tf_label = tf_label
         self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
@@ -208,46 +307,87 @@ class Bot:
         self.max_losses = max_losses_per_day
         self.max_positions = max_positions
         self.log = log
+        self._load_state = load_state
+        self._save_state = save_state
         self.stop_event = threading.Event()
         self.rr = 2.0
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
 
-    def sfp_signal(self, symbol):
+    # --- сохранение счётчика стопов ---
+    def load_losses(self):
+        if not self._load_state:
+            return
         try:
-            c = self.api.candles(symbol, limit=30)
-        except Exception as ex:
-            # Если тикер не существует — просто пропускаем
-            self.log(f"{symbol}: ошибка свечей — {ex}")
-            return None, None
+            st = self._load_state()
+            if st and st.get("date") == dt.date.today().isoformat():
+                self.losses_today = int(st.get("losses", 0))
+                if self.losses_today:
+                    self.log(f"Восстановлен счётчик стопов за сегодня: {self.losses_today}")
+        except Exception:
+            pass
 
+    def persist_losses(self):
+        if not self._save_state:
+            return
+        try:
+            self._save_state({"date": dt.date.today().isoformat(),
+                              "losses": self.losses_today})
+        except Exception:
+            pass
+
+    # --- восстановление позиций с биржи ---
+    def recover(self):
+        try:
+            open_pos = self.api.open_positions()
+        except Exception as ex:
+            self.log(f"Не удалось получить открытые позиции: {ex}")
+            return
+        for sym, info in open_pos.items():
+            stop, tp = self.api.pending_exit_prices(sym)
+            self.positions[sym] = {"side": info["side"], "entry": info["entry"],
+                                   "stop": stop, "tp": tp, "qty": info["qty"]}
+            msg = (f"Восстановлена позиция {info['side']} {sym} "
+                   f"по {info['entry']}, объём {info['qty']}")
+            if stop is None or tp is None:
+                msg += " — стоп/тейк на бирже не найдены, проверьте вручную"
+            self.log(msg)
+        if open_pos:
+            self.log(f"Итого восстановлено позиций: {len(open_pos)}")
+        self.load_losses()
+
+    def sfp_signal(self, symbol):
+        c = self.api.candles(symbol, limit=30)
         if len(c) < 22:
             return None, None
         prev, last = c[-2], c[-1]
-        avg_vol = sum(x for x in c[-21:-1]) / 20
+        avg_vol = sum(x[4] for x in c[-21:-1]) / 20
 
+        # кил-зоны считаются по UTC: 10:00–13:00 и 16:00–19:00 по Москве
         now = dt.datetime.utcnow()
         kill_zone = (7 <= now.hour < 10) or (13 <= now.hour < 16)
 
-        long_sig = (last < prev and
-                    last > prev and
-                    last > self.vol_mult * avg_vol and
+        long_sig = (last[2] < prev[2] and
+                    last[3] > prev[2] and
+                    last[4] > self.vol_mult * avg_vol and
                     kill_zone)
-        short_sig = (last > prev and
-                     last < prev and
-                     last > self.vol_mult * avg_vol and
+        short_sig = (last[1] > prev[1] and
+                     last[3] < prev[1] and
+                     last[4] > self.vol_mult * avg_vol and
                      kill_zone)
         if long_sig:
-            return "LONG", last
+            return "LONG", last[2]
         if short_sig:
-            return "SHORT", last
+            return "SHORT", last[1]
         return None, None
 
     def run(self):
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
                  f"(фильтр объёма ×{self.vol_mult}). "
                  f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
+        self.log(MOSCOW_HINT)
+        self.recover()
         while not self.stop_event.is_set():
             try:
                 self.tick()
@@ -262,9 +402,44 @@ class Bot:
     def tick(self):
         if self.day != dt.date.today():
             self.day, self.losses_today = dt.date.today(), 0
+            self.persist_losses()
 
+        # --- сверка с биржей: убираем позиции, закрытые биржевыми ордерами ---
+        open_pos = None
+        try:
+            open_pos = self.api.open_positions()
+        except Exception as ex:
+            self.log(f"Ошибка получения позиций: {ex}")
+
+        if open_pos is not None:
+            for symbol in list(self.positions):
+                if symbol in open_pos:
+                    continue
+                p = self.positions[symbol]
+                try:
+                    cur = self.api.price(symbol)
+                except Exception:
+                    cur = None
+                if cur is not None and p.get("stop") is not None and \
+                        ((p["side"] == "LONG" and cur <= p["stop"]) or
+                         (p["side"] == "SHORT" and cur >= p["stop"])):
+                    self.losses_today += 1
+                    self.persist_losses()
+                    self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
+                elif cur is not None and p.get("tp") is not None and \
+                        ((p["side"] == "LONG" and cur >= p["tp"]) or
+                         (p["side"] == "SHORT" and cur <= p["tp"])):
+                    self.log(f"ТЕЙК {symbol} достигнут (+2R)")
+                else:
+                    self.log(f"{symbol}: позиция закрыта на бирже "
+                             f"(стоп или тейк сработали)")
+                del self.positions[symbol]
+
+        # --- страховочный мониторинг по цене ---
         for symbol in list(self.positions):
             p = self.positions[symbol]
+            if p.get("stop") is None or p.get("tp") is None:
+                continue
             try:
                 cur = self.api.price(symbol)
             except Exception:
@@ -274,6 +449,9 @@ class Bot:
             hit_tp = (p["side"] == "LONG" and cur >= p["tp"]) or \
                      (p["side"] == "SHORT" and cur <= p["tp"])
             if hit_stop or hit_tp:
+                still_open = (open_pos is None) or (symbol in open_pos)
+                if not still_open:
+                    continue
                 try:
                     self.api.order(symbol,
                                    "Sell" if p["side"] == "LONG" else "Buy",
@@ -283,11 +461,13 @@ class Bot:
                     continue
                 if hit_stop:
                     self.losses_today += 1
+                    self.persist_losses()
                     self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
                 else:
                     self.log(f"ТЕЙК {symbol} достигнут (+2R)")
                 del self.positions[symbol]
 
+        # --- новые входы ---
         if self.losses_today >= self.max_losses:
             return
         if len(self.positions) >= self.max_positions:
@@ -317,16 +497,28 @@ class Bot:
 
             try:
                 self.api.order(symbol, "Buy" if side == "LONG" else "Sell", qty)
-                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
-                               qty, stop=round(stop, 6), reduce_only=True)
             except Exception as ex:
-                self.log(f"{symbol}: ордер не прошёл — {ex}")
+                self.log(f"{symbol}: вход не прошёл — {ex}")
                 continue
+
             self.positions[symbol] = {"side": side, "entry": entry,
                                       "stop": stop, "tp": tp, "qty": qty}
             self.log(f"ВХОД {side} {symbol} по {entry}, "
                      f"стоп {stop:.4f}, тейк {tp:.4f} "
                      f"[{len(self.positions)}/{self.max_positions}]")
+
+            try:
+                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
+                               qty, stop=round(stop, 6), reduce_only=True)
+            except Exception as ex:
+                self.log(f"{symbol}: стоп-ордер не выставлен — {ex}. "
+                         f"Закройте позицию вручную!")
+            try:
+                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
+                               qty, tp=round(tp, 6), reduce_only=True)
+            except Exception as ex:
+                self.log(f"{symbol}: тейк-ордер не выставлен — {ex}. "
+                         f"Позиция закроется только по стопу или вручную")
             break
 
 
@@ -363,6 +555,18 @@ def main(page: ft.Page):
 
     profiles = load_profiles()
 
+    def load_state():
+        try:
+            return page.client_storage.get(LOSSES_KEY)
+        except Exception:
+            return None
+
+    def save_state(data):
+        try:
+            page.client_storage.set(LOSSES_KEY, data)
+        except Exception:
+            pass
+
     ex = ft.Dropdown(label="Биржа",
                      options=[ft.dropdown.Option("Bybit"),
                               ft.dropdown.Option("BingX")],
@@ -378,7 +582,13 @@ def main(page: ft.Page):
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
         label="Пары через запятую",
-        value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,ZECUSDT,HYPEUSDT,XPLUSDT,UNIUSDT,NEARUSDT,DOGEUSDT,ADAUSDT,LTCUSDT,LINKUSDT,AVAXUSDT,TRXUSDT,DOTUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,JUPUSDT,FILUSDT,ATOMUSDT,XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,WLFIUSDT,PUMPUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT")
+        value="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,ZECUSDT,HYPEUSDT,XPLUSDT,"
+              "UNIUSDT,NEARUSDT,DOGEUSDT,ADAUSDT,LTCUSDT,LINKUSDT,AVAXUSDT,TRXUSDT,"
+              "DOTUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,JUPUSDT,FILUSDT,ATOMUSDT,"
+              "XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,"
+              "ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,"
+              "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,WLFIUSDT,PUMPUSDT,"
+              "ASTERUSDT,NIGHTUSDT,ENAUSDT")
     deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
     losses = ft.TextField(label="Макс. стопов в день", value="3")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
@@ -389,9 +599,10 @@ def main(page: ft.Page):
     profile_dd = ft.Dropdown(
         label="Сохранённые профили",
         options=[ft.dropdown.Option(k) for k in sorted(profiles)],
-        value=sorted(profiles) if profiles else None)
+        value=sorted(profiles)[0] if profiles else None)
 
     status = ft.Text("Остановлен", size=18, weight=ft.FontWeight.BOLD)
+    moscow_note = ft.Text(MOSCOW_HINT, size=14, weight=ft.FontWeight.BOLD)
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
 
@@ -417,7 +628,7 @@ def main(page: ft.Page):
     def refresh_dd(selected=None):
         profile_dd.options = [ft.dropdown.Option(k) for k in sorted(profiles)]
         profile_dd.value = selected if selected in profiles else \
-            (sorted(profiles) if profiles else None)
+            (sorted(profiles)[0] if profiles else None)
         page.update()
 
     def on_save(e):
@@ -481,7 +692,8 @@ def main(page: ft.Page):
                            demo, tf_cfg["interval_bingx"])
         try:
             bot = Bot(api, tf.value, pairs, float(deposit.value),
-                      int(losses.value), int(maxpos.value), add_log)
+                      int(losses.value), int(maxpos.value), add_log,
+                      load_state=load_state, save_state=save_state)
         except ValueError:
             add_log("Проверьте числа в настройках")
             return
@@ -517,12 +729,22 @@ def main(page: ft.Page):
         ]),
         ft.Container(maxpos, expand=1),
         tg_token, tg_chat,
+        moscow_note,
         ft.Row([
             ft.FilledButton("Запустить", on_click=on_start, expand=True),
             ft.FilledButton("Остановить", on_click=on_stop, expand=True),
         ]),
         status,
-        ft.Divider(),
-        ft.Text("Журнал:", weight=ft.FontWeight.BOLD),
-        log_view,
-    ]))
+        ft.Divider(), ft.Text("Журнал:"), log_view,
+    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
+
+    try:
+        last = page.client_storage.get(LAST_KEY)
+        if last and last in profiles:
+            apply(profiles[last])
+            refresh_dd(last)
+    except Exception:
+        pass
+
+
+ft.run(main)
