@@ -12,8 +12,6 @@ STORAGE_KEY = "sfp_profiles"
 LAST_KEY = "sfp_last_profile"
 
 # ---------- конфигурация таймфреймов ----------
-# interval_* — код интервала для API каждой биржи
-# vol_mult   — множитель фильтра объёма (строже на младших ТФ)
 TIMEFRAMES = {
     "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
     "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
@@ -178,7 +176,7 @@ class Bot:
         self.max_positions = max_positions
         self.log = log
         self.stop_event = threading.Event()
-        self.rr = 2.0                     # тейк = 2 × риск на любом ТФ
+        self.rr = 2.0
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
@@ -202,9 +200,9 @@ class Bot:
                      last[4] > self.vol_mult * avg_vol and
                      kill_zone)
         if long_sig:
-            return "LONG", last[2]      # стоп = минимум текущей свечи
+            return "LONG", last[2]
         if short_sig:
-            return "SHORT", last[1]     # стоп = максимум текущей свечи
+            return "SHORT", last[1]
         return None, None
 
     def run(self):
@@ -464,20 +462,29 @@ def main(page: ft.Page):
         status.value = "Остановлен"
         page.update()
 
+    # --- кнопки-полоски на всю ширину: ничего не выдавливается на узком экране ---
     page.add(ft.Column([
         profile_dd,
-        ft.Row([profile_name,
-                ft.FilledButton("Сохранить", on_click=on_save)]),
-        ft.Row([ft.FilledButton("Загрузить", on_click=on_load),
-                ft.OutlinedButton("Удалить", on_click=on_delete)]),
+        profile_name,
+        ft.FilledButton("Сохранить настройки", on_click=on_save, expand=True),
+        ft.Row([
+            ft.FilledButton("Загрузить", on_click=on_load, expand=True),
+            ft.OutlinedButton("Удалить", on_click=on_delete, expand=True),
+        ]),
         ft.Divider(),
         ex, mode, tf,
         api_key, secret,
         symbols,
-        deposit, losses, maxpos,
+        ft.Row([
+            ft.Container(deposit, expand=1),
+            ft.Container(losses, expand=1),
+        ]),
+        ft.Container(maxpos, expand=1),
         tg_token, tg_chat,
-        ft.Row([ft.FilledButton("Запустить", on_click=on_start),
-                ft.FilledButton("Остановить", on_click=on_stop)]),
+        ft.Row([
+            ft.FilledButton("Запустить", on_click=on_start, expand=True),
+            ft.FilledButton("Остановить", on_click=on_stop, expand=True),
+        ]),
         status,
         ft.Divider(), ft.Text("Журнал:"), log_view,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
