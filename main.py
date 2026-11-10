@@ -4,7 +4,7 @@ import requests
 import flet as ft
 
 BYBIT_REAL = "https://api.bybit.com"
-BYBIT_DEMO = "https://api-testnet.bybit.com"
+BYBIT_DEMO = "https://api-demo.bybit.com"
 BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
