@@ -15,7 +15,6 @@ LOSSES_KEY = "sfp_losses_state"
 MOSCOW_HINT = ("⏰ По Москве: кил-зоны 10:00–13:00 и 16:00–19:00. "
                "Бот включайте с 9:30 до 19:00 по МСК, в остальное время сигналов не будет.")
 
-# ---------- конфигурация таймфреймов ----------
 TIMEFRAMES = {
     "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
     "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
@@ -23,7 +22,6 @@ TIMEFRAMES = {
     "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
 }
 
-# ---------- псевдонимы тикеров (универсальное имя -> тикер биржи) ----------
 BYBIT_ALIASES = {
     "PEPEUSDT":  "1000PEPEUSDT",
     "BONKUSDT":  "1000BONKUSDT",
@@ -44,8 +42,6 @@ BINGX_ALIASES = {
     "WIFUSDT":   "WIFUSDT",
 }
 
-
-# ---------- API-адаптеры ----------
 
 class BybitAPI:
     def __init__(self, api_key, secret, demo, interval):
@@ -82,6 +78,8 @@ class BybitAPI:
             body = json.dumps(params)
             r = requests.post(f"{self.base}{path}", data=body,
                               headers=self._headers(body), timeout=15)
+        if not r.text.strip():
+            raise RuntimeError("пустой ответ — проверьте ключ и права")
         d = r.json()
         if d.get("retCode") != 0:
             raise RuntimeError(f"Bybit: {d.get('retMsg')}")
@@ -127,7 +125,6 @@ class BybitAPI:
         return out
 
     def pending_exit_prices(self, symbol):
-        """Восстановление стопа/тейка с биржевых ордеров."""
         sym = self.sym(symbol)
         stop = tp = None
         try:
@@ -204,6 +201,8 @@ class BingXAPI:
         url = f"{self.base}{path}?{qs}"
         r = requests.post(url, timeout=15) if method == "POST" \
             else requests.get(url, headers=headers, timeout=15)
+        if not r.text.strip():
+            raise RuntimeError("пустой ответ — проверьте ключ и права")
         d = r.json()
         if d.get("code") != 0:
             raise RuntimeError(f"BingX: {d.get('msg')}")
@@ -293,8 +292,6 @@ class BingXAPI:
         return self.req("POST", "/openApi/swap/v2/trade/order", p)
 
 
-# ---------- торговое ядро ----------
-
 class Bot:
     def __init__(self, api, tf_label, symbols, deposit_pct,
                  max_losses_per_day, max_positions, log,
@@ -315,7 +312,6 @@ class Bot:
         self.losses_today = 0
         self.positions = {}
 
-    # --- сохранение счётчика стопов ---
     def load_losses(self):
         if not self._load_state:
             return
@@ -337,7 +333,6 @@ class Bot:
         except Exception:
             pass
 
-    # --- восстановление позиций с биржи ---
     def recover(self):
         try:
             open_pos = self.api.open_positions()
@@ -364,7 +359,6 @@ class Bot:
         prev, last = c[-2], c[-1]
         avg_vol = sum(x[4] for x in c[-21:-1]) / 20
 
-        # кил-зоны считаются по UTC: 10:00–13:00 и 16:00–19:00 по Москве
         now = dt.datetime.utcnow()
         kill_zone = (7 <= now.hour < 10) or (13 <= now.hour < 16)
 
@@ -387,10 +381,16 @@ class Bot:
                  f"(фильтр объёма ×{self.vol_mult}). "
                  f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
         self.log(MOSCOW_HINT)
+        try:
+            bal = self.api.balance()
+            self.log(f"Баланс: {bal:.2f} USDT — API-доступ подтверждён")
+        except Exception as ex:
+            self.log(f"[API FAIL] Баланс не получен: {ex}")
         self.recover()
         while not self.stop_event.is_set():
             try:
                 self.tick()
+                self.log(f"Цикл выполнен. Открытых позиций: {len(self.positions)}")
             except Exception as ex:
                 self.log(f"Ошибка: {ex}")
             for _ in range(60):
@@ -404,7 +404,6 @@ class Bot:
             self.day, self.losses_today = dt.date.today(), 0
             self.persist_losses()
 
-        # --- сверка с биржей: убираем позиции, закрытые биржевыми ордерами ---
         open_pos = None
         try:
             open_pos = self.api.open_positions()
@@ -435,7 +434,6 @@ class Bot:
                              f"(стоп или тейк сработали)")
                 del self.positions[symbol]
 
-        # --- страховочный мониторинг по цене ---
         for symbol in list(self.positions):
             p = self.positions[symbol]
             if p.get("stop") is None or p.get("tp") is None:
@@ -467,7 +465,6 @@ class Bot:
                     self.log(f"ТЕЙК {symbol} достигнут (+2R)")
                 del self.positions[symbol]
 
-        # --- новые входы ---
         if self.losses_today >= self.max_losses:
             return
         if len(self.positions) >= self.max_positions:
@@ -521,8 +518,6 @@ class Bot:
                          f"Позиция закроется только по стопу или вручную")
             break
 
-
-# ---------- интерфейс ----------
 
 def tg_send(cfg, text):
     if not cfg.get("token") or not cfg.get("chat"):
@@ -666,10 +661,11 @@ def main(page: ft.Page):
 
     profile_dd.on_change = on_load
 
-    state = {"bot": None, "thread": None}
+    state = {"bot": None, "thread": None, "active": False}
 
     def on_start(e):
-        if state["thread"] and state["thread"].is_alive():
+        if state["active"]:
+            add_log("Бот уже работает — сначала нажмите Остановить")
             return
         pairs = [s.strip().replace("-", "").replace("/", "").upper()
                  for s in symbols.value.split(",") if s.strip()]
@@ -700,6 +696,7 @@ def main(page: ft.Page):
         cfg["token"] = tg_token.value.strip()
         cfg["chat"] = tg_chat.value.strip()
         state["bot"] = bot
+        state["active"] = True
         state["thread"] = threading.Thread(target=bot.run, daemon=True)
         state["thread"].start()
         status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
@@ -708,6 +705,7 @@ def main(page: ft.Page):
     def on_stop(e):
         if state["bot"]:
             state["bot"].stop_event.set()
+        state["active"] = False
         status.value = "Остановлен"
         page.update()
 
