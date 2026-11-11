@@ -43,6 +43,8 @@ BINGX_ALIASES = {
     "WIFUSDT":   "WIFUSDT",
 }
 
+EMA_PERIOD = 50  # период EMA для фильтра тренда
+
 
 def round_step(value, step):
     """Округление вниз до кратности шагу, без float-артефактов."""
@@ -69,6 +71,17 @@ def calc_3tp(entry, stop, side):
     if side == "LONG":
         return [entry + step, entry + 2 * step, entry + 3 * step]
     return [entry - step, entry - 2 * step, entry - 3 * step]
+
+
+def ema(values, period):
+    """EMA по списку закрытий. Возвращает последнее значение или None."""
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    e = sum(values[:period]) / period  # старт: SMA первых period значений
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
 
 
 class BybitAPI:
@@ -152,10 +165,10 @@ class BybitAPI:
             return round(price, 6)
         return round_step(price, info["tick"])
 
-    def candles(self, symbol, limit=30):
+    def candles(self, symbol, limit=30, interval=None):
         d = self.req("GET", "/v5/market/kline",
                      {"category": "linear", "symbol": self.sym(symbol),
-                      "interval": self.interval, "limit": limit})
+                      "interval": interval or self.interval, "limit": limit})
         rows = [(float(k[1]), float(k[2]), float(k[3]),
                  float(k[4]), float(k[5])) for k in d["list"]]
         return list(reversed(rows))
@@ -357,9 +370,10 @@ class BingXAPI:
             return round(price, 6)
         return round_step(price, info["tick"])
 
-    def candles(self, symbol, limit=30):
+    def candles(self, symbol, limit=30, interval=None):
         d = self.req("GET", "/openApi/swap/v2/quote/kline",
-                     {"symbol": self.fmt(symbol), "interval": self.interval,
+                     {"symbol": self.fmt(symbol),
+                      "interval": interval or self.interval,
                       "limit": limit})
         rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
                  float(k["c"]), float(k["v"])) for k in d]
@@ -457,12 +471,18 @@ class BingXAPI:
 
 
 class Bot:
-    def __init__(self, api, tf_label, symbols, deposit_pct,
+    def __init__(self, api, tf_label, trend_label, symbols, deposit_pct,
                  max_losses_per_day, max_positions, log,
                  load_state=None, save_state=None):
         self.api = api
         self.tf_label = tf_label
         self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
+        # интервал старшего ТФ для EMA-фильтра
+        if api.base in (BYBIT_REAL, BYBIT_DEMO):
+            self.trend_interval = TIMEFRAMES[trend_label]["interval_bybit"]
+        else:
+            self.trend_interval = TIMEFRAMES[trend_label]["interval_bingx"]
+        self.trend_label = trend_label
         self.symbols = symbols
         self.deposit_pct = deposit_pct
         self.max_losses = max_losses_per_day
@@ -567,6 +587,24 @@ class Bot:
             self.log(f"Итого восстановлено позиций: {len(open_pos)}")
         self.load_losses()
 
+    def trend_ok(self, symbol, side):
+        """EMA-фильтр тренда по старшему ТФ: LONG — цена выше EMA, SHORT — ниже."""
+        try:
+            c = self.api.candles(symbol, limit=EMA_PERIOD * 2,
+                                 interval=self.trend_interval)
+        except Exception as ex:
+            self.log(f"{symbol}: EMA не получена ({ex}) — сигнал пропущен")
+            return False
+        closes = [x[3] for x in c]
+        e = ema(closes, EMA_PERIOD)
+        if e is None:
+            self.log(f"{symbol}: мало свечей для EMA{EMA_PERIOD} — сигнал пропущен")
+            return False
+        cur = closes[-1]
+        if side == "LONG":
+            return cur > e
+        return cur < e
+
     def sfp_signal(self, symbol):
         c = self.api.candles(symbol, limit=30)
         if len(c) < 22:
@@ -593,7 +631,8 @@ class Bot:
 
     def run(self):
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
-                 f"(фильтр объёма ×{self.vol_mult}). "
+                 f"(фильтр объёма ×{self.vol_mult}), тренд: EMA{EMA_PERIOD} "
+                 f"на {self.trend_label}. "
                  f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
         self.log(MOSCOW_HINT)
         try:
@@ -712,6 +751,12 @@ class Bot:
             if not side:
                 continue
 
+            # EMA-фильтр тренда: сигналы против тренда отбрасываются
+            if not self.trend_ok(symbol, side):
+                self.log(f"{symbol}: SFP {side} против тренда "
+                         f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
+                continue
+
             entry = self.api.price(symbol)
             stop = self.api.price_ok(symbol, stop_lvl)
             raw_qty = self.api.balance() * self.deposit_pct / entry
@@ -816,6 +861,9 @@ def main(page: ft.Page):
     tf = ft.Dropdown(label="Таймфрейм",
                      options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
                      value="4 часа")
+    trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
+                           options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
+                           value="4 часа")
     api_key = ft.TextField(label="API-ключ", password=True, can_reveal_password=True)
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
@@ -859,9 +907,9 @@ def main(page: ft.Page):
             ft.Text(f"{dt.datetime.now():%H:%M:%S}  Журнал очищен (бот продолжает работать)"))
         page.update()
 
-    FIELDS = {"ex": ex, "mode": mode, "tf": tf, "api_key": api_key,
-              "secret": secret, "symbols": symbols, "deposit": deposit,
-              "losses": losses, "maxpos": maxpos,
+    FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
+              "api_key": api_key, "secret": secret, "symbols": symbols,
+              "deposit": deposit, "losses": losses, "maxpos": maxpos,
               "tg_token": tg_token, "tg_chat": tg_chat}
 
     def collect():
@@ -936,6 +984,9 @@ def main(page: ft.Page):
         if not tf_cfg:
             add_log("Выберите таймфрейм из списка")
             return
+        if trend_tf.value not in TIMEFRAMES:
+            add_log("Выберите тренд-ТФ из списка")
+            return
         demo = mode.value == "Демо"
         if ex.value == "Bybit":
             api = BybitAPI(api_key.value.strip(), secret.value.strip(),
@@ -944,7 +995,8 @@ def main(page: ft.Page):
             api = BingXAPI(api_key.value.strip(), secret.value.strip(),
                            demo, tf_cfg["interval_bingx"])
         try:
-            bot = Bot(api, tf.value, pairs, float(deposit.value),
+            bot = Bot(api, tf.value, trend_tf.value, pairs,
+                      float(deposit.value),
                       int(losses.value), int(maxpos.value), add_log,
                       load_state=load_state, save_state=save_state)
         except ValueError:
@@ -978,7 +1030,7 @@ def main(page: ft.Page):
             ft.OutlinedButton("Удалить", on_click=on_delete, expand=True),
         ]),
         ft.Divider(),
-        ex, mode, tf,
+        ex, mode, tf, trend_tf,
         api_key, secret,
         symbols,
         ft.Row([
@@ -993,7 +1045,8 @@ def main(page: ft.Page):
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
 
     log_tab = ft.Column([
-        ft.OutlinedButton("Очистить журнал", on_click=on_clear_log, expand=True),
+        # компактная кнопка: ширина по тексту, слева, не растянута на весь экран
+        ft.Row([ft.OutlinedButton("Очистить журнал", on_click=on_clear_log)]),
         log_view,
     ], spacing=10, expand=True)
 
