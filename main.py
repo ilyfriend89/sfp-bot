@@ -1,4 +1,4 @@
-import time, hmac, hashlib, urllib.parse, threading, json
+import time, hmac, hashlib, urllib.parse, threading, json, os
 import datetime as dt
 from decimal import Decimal, ROUND_DOWN
 import requests
@@ -9,9 +9,9 @@ BYBIT_DEMO = "https://api-demo.bybit.com"
 BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
-STORAGE_KEY = "sfp_profiles"
-LAST_KEY = "sfp_last_profile"
-LOSSES_KEY = "sfp_losses_state"
+# каталог данных приложения: переживает перезапуск и обновление APK
+STATE_FILE = os.path.join(os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd(),
+                          "sfp_state.json")
 
 MOSCOW_HINT = ("⏰ По Москве: кил-зоны 10:00–13:00 и 16:00–19:00. "
                "Бот включайте с 9:30 до 19:00 по МСК, в остальное время сигналов не будет.")
@@ -45,6 +45,24 @@ BINGX_ALIASES = {
 
 EMA_PERIOD = 50      # период EMA для фильтра тренда
 EMA_OFF = "Выключен" # значение тренд-ТФ, отключающее фильтр
+
+
+def state_load():
+    """Читает всё хранилище (профили, последний профиль, счётчик стопов)."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def state_save(data):
+    """Записывает всё хранилище целиком."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def round_step(value, step):
@@ -868,31 +886,24 @@ def main(page: ft.Page):
     # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
     page.padding = 48
 
+    # ---- файловое хранилище вместо client_storage ----
     def load_profiles():
-        try:
-            return page.client_storage.get(STORAGE_KEY) or {}
-        except Exception:
-            return {}
+        return state_load().get("profiles") or {}
 
     def save_profiles(p):
-        try:
-            page.client_storage.set(STORAGE_KEY, p)
-        except Exception:
-            pass
+        d = state_load()
+        d["profiles"] = p
+        state_save(d)
 
     profiles = load_profiles()
 
     def load_state():
-        try:
-            return page.client_storage.get(LOSSES_KEY)
-        except Exception:
-            return None
+        return state_load().get("losses")
 
     def save_state(data):
-        try:
-            page.client_storage.set(LOSSES_KEY, data)
-        except Exception:
-            pass
+        d = state_load()
+        d["losses"] = data
+        state_save(d)
 
     ex = ft.Dropdown(label="Биржа",
                      options=[ft.dropdown.Option("Bybit"),
@@ -978,6 +989,10 @@ def main(page: ft.Page):
             return
         profiles[name] = collect()
         save_profiles(profiles)
+        # последний использованный профиль — тоже в файл
+        d = state_load()
+        d["last_profile"] = name
+        state_save(d)
         refresh_dd(name)
         profile_name.value = ""
         add_log(f"Профиль «{name}» сохранён")
@@ -988,10 +1003,9 @@ def main(page: ft.Page):
             add_log("Выберите профиль из списка")
             return
         apply(profiles[name])
-        try:
-            page.client_storage.set(LAST_KEY, name)
-        except Exception:
-            pass
+        d = state_load()
+        d["last_profile"] = name
+        state_save(d)
         add_log(f"Профиль «{name}» загружен")
 
     def on_delete(e):
@@ -1115,8 +1129,9 @@ def main(page: ft.Page):
         content,
     ], spacing=10, expand=True))
 
+    # восстановление последнего профиля из файла
     try:
-        last = page.client_storage.get(LAST_KEY)
+        last = state_load().get("last_profile")
         if last and last in profiles:
             apply(profiles[last])
             refresh_dd(last)
