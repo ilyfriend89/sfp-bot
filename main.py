@@ -441,7 +441,7 @@ class BingXAPI:
                      {"symbol": self.fmt(symbol)})
         return float(d[0]["lastPrice"])
 
-        def balance(self):
+    def balance(self):
         try:
             d = self.req("GET", "/openApi/swap/v2/user/balance", {})
             # BingX возвращает data объектом с полями баланса, а не списком монет
