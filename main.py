@@ -43,7 +43,8 @@ BINGX_ALIASES = {
     "WIFUSDT":   "WIFUSDT",
 }
 
-EMA_PERIOD = 50  # период EMA для фильтра тренда
+EMA_PERIOD = 50      # период EMA для фильтра тренда
+EMA_OFF = "Выключен" # значение тренд-ТФ, отключающее фильтр
 
 
 def round_step(value, step):
@@ -477,12 +478,16 @@ class Bot:
         self.api = api
         self.tf_label = tf_label
         self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
-        # интервал старшего ТФ для EMA-фильтра
-        if api.base in (BYBIT_REAL, BYBIT_DEMO):
-            self.trend_interval = TIMEFRAMES[trend_label]["interval_bybit"]
-        else:
-            self.trend_interval = TIMEFRAMES[trend_label]["interval_bingx"]
+        # фильтр тренда по EMA; можно полностью выключить выбором EMA_OFF
         self.trend_label = trend_label
+        self.trend_enabled = (trend_label != EMA_OFF)
+        if self.trend_enabled:
+            if api.base in (BYBIT_REAL, BYBIT_DEMO):
+                self.trend_interval = TIMEFRAMES[trend_label]["interval_bybit"]
+            else:
+                self.trend_interval = TIMEFRAMES[trend_label]["interval_bingx"]
+        else:
+            self.trend_interval = None
         self.symbols = symbols
         self.deposit_pct = deposit_pct
         self.max_losses = max_losses_per_day
@@ -600,7 +605,10 @@ class Bot:
         self.load_losses()
 
     def trend_ok(self, symbol, side):
-        """EMA-фильтр тренда по старшему ТФ: LONG — цена выше EMA, SHORT — ниже."""
+        """EMA-фильтр тренда по старшему ТФ: LONG — цена выше EMA, SHORT — ниже.
+        Если фильтр выключен в настройках, всегда разрешает вход."""
+        if not self.trend_enabled:
+            return True
         try:
             c = self.api.candles(symbol, limit=EMA_PERIOD * 2,
                                  interval=self.trend_interval)
@@ -642,9 +650,12 @@ class Bot:
         return None, None
 
     def run(self):
+        if self.trend_enabled:
+            trend_info = f"тренд: EMA{EMA_PERIOD} на {self.trend_label}"
+        else:
+            trend_info = "EMA-фильтр выключен"
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
-                 f"(фильтр объёма ×{self.vol_mult}), тренд: EMA{EMA_PERIOD} "
-                 f"на {self.trend_label}. "
+                 f"(фильтр объёма ×{self.vol_mult}), {trend_info}. "
                  f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
         self.log(MOSCOW_HINT)
         try:
@@ -687,12 +698,20 @@ class Bot:
                     cur = self.api.price(symbol)
                 except Exception:
                     cur = None
-                if cur is not None and p["stop_price"] is not None and (
-                        (p["side"] == "LONG" and cur <= p["stop_price"]) or
-                        (p["side"] == "SHORT" and cur >= p["stop_price"])):
+                # настоящая остановка по стопу — только если закрытие хуже входа
+                stopped = (cur is not None and p["stop_price"] is not None and
+                           ((p["side"] == "LONG" and cur <= p["stop_price"]) or
+                            (p["side"] == "SHORT" and cur >= p["stop_price"])))
+                loss_close = (cur is not None and
+                              ((p["side"] == "LONG" and cur < p["entry"]) or
+                               (p["side"] == "SHORT" and cur > p["entry"])))
+                if stopped and loss_close:
                     self.losses_today += 1
                     self.persist_losses()
                     self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
+                elif stopped:
+                    self.log(f"{symbol}: позиция закрыта по перенесённому стопу — "
+                             f"безубыток/профит, в счёт стопов не идёт")
                 elif cur is not None and (
                         (p["side"] == "LONG" and cur >= p["tp_levels"][2]) or
                         (p["side"] == "SHORT" and cur <= p["tp_levels"][2])):
@@ -739,10 +758,16 @@ class Bot:
                         self.api.order(symbol,
                                        "Sell" if p["side"] == "LONG" else "Buy",
                                        p["qty"], reduce_only=True)
-                        self.losses_today += 1
-                        self.persist_losses()
-                        self.log(f"СТОП по {symbol} (резервное закрытие). "
-                                 f"Стопов за день: {self.losses_today}")
+                        loss_close = ((p["side"] == "LONG" and cur < p["entry"]) or
+                                      (p["side"] == "SHORT" and cur > p["entry"]))
+                        if loss_close:
+                            self.losses_today += 1
+                            self.persist_losses()
+                            self.log(f"СТОП по {symbol} (резервное закрытие). "
+                                     f"Стопов за день: {self.losses_today}")
+                        else:
+                            self.log(f"{symbol}: резервное закрытие — "
+                                     f"безубыток/профит, в счёт стопов не идёт")
                         # снимаем оставшиеся тейк-ордера
                         self.cleanup_orders(symbol)
                         del self.positions[symbol]
@@ -771,8 +796,9 @@ class Bot:
 
             # EMA-фильтр тренда: сигналы против тренда отбрасываются
             if not self.trend_ok(symbol, side):
-                self.log(f"{symbol}: SFP {side} против тренда "
-                         f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
+                if self.trend_enabled:
+                    self.log(f"{symbol}: SFP {side} против тренда "
+                             f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
                 continue
 
             entry = self.api.price(symbol)
@@ -880,7 +906,8 @@ def main(page: ft.Page):
                      options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
                      value="4 часа")
     trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
-                           options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
+                           options=[ft.dropdown.Option(EMA_OFF)] +
+                                   [ft.dropdown.Option(k) for k in TIMEFRAMES],
                            value="4 часа")
     api_key = ft.TextField(label="API-ключ", password=True, can_reveal_password=True)
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
@@ -1002,7 +1029,7 @@ def main(page: ft.Page):
         if not tf_cfg:
             add_log("Выберите таймфрейм из списка")
             return
-        if trend_tf.value not in TIMEFRAMES:
+        if trend_tf.value != EMA_OFF and trend_tf.value not in TIMEFRAMES:
             add_log("Выберите тренд-ТФ из списка")
             return
         demo = mode.value == "Демо"
