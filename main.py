@@ -49,6 +49,10 @@ EMA_OFF = "Выключен" # значение тренд-ТФ, отключа�
 # сопровождение позиций: опрос каждые N секунд; сигналы — раз в минуту
 FAST_PERIOD = 5      # проверка позиций каждые 5 секунд
 
+# вклад каждого исполненного тейка в итог сделки (в R):
+# тейк i закрывает 1/3 объёма на расстоянии 1.9*(i/3)*r от входа
+TP_R_CONTRIB = [1.9 * (i + 1) / 9.0 for i in range(3)]  # 0.211, 0.422, 0.633
+
 
 def state_load():
     """Читает всё хранилище (профили, последний профиль, счётчик стопов)."""
@@ -84,7 +88,8 @@ def qstr(x):
 
 
 def calc_3tp(entry, stop, side):
-    """Три тейка на равном расстоянии. Полная цель — 1.9R вместо прежних 2R.
+    """Три тейка на равном расстоянии. Полная цель по цене — 1.9R.
+    Взвешенный результат полной сделки — около +1.27R (см. статистику).
     Возвращает [tp1, tp2, tp3]."""
     r = abs(entry - stop)
     if r <= 0:
@@ -558,7 +563,6 @@ class Bot:
         self._load_state = load_state
         self._save_state = save_state
         self.stop_event = threading.Event()
-        self.total_rr = 1.9  # полная цель по тейкам: чуть меньше прежних 2R
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
@@ -567,6 +571,10 @@ class Bot:
         self.stat_skipped = 0   # из них отсечено EMA-фильтром
         self.stat_entries = 0   # реальных входов в сделку
         self.last_stat_hour = None
+        # статистика исходов сделок за день
+        self.stat_out = {"СТОП": 0, "БЕЗУБЫТОК": 0,
+                         "ТЕЙК-ПОЛНЫЙ": 0, "ПРОЧЕЕ": 0}
+        self.stat_r = 0.0  # суммарный результат за день в R
 
     def load_losses(self):
         if not self._load_state:
@@ -590,20 +598,57 @@ class Bot:
             pass
 
     def log_stats_if_due(self):
-        """Раз в час пишет сводку по сигналам за текущее число."""
+        """Раз в час пишет сводку по сигналам и сделкам за текущее число."""
         hour = dt.datetime.now().hour
         if self.last_stat_hour is not None and hour == self.last_stat_hour:
             return
         self.last_stat_hour = hour
-        if self.trend_enabled:
-            self.log(f"Статистика за {self.day.strftime('%d.%m.%Y')}: "
-                     f"сигналов SFP — {self.stat_signals}, "
-                     f"пропущено EMA — {self.stat_skipped}, "
-                     f"входов — {self.stat_entries}")
+        o = self.stat_out
+        trend_part = (f"пропущено EMA — {self.stat_skipped}, "
+                      if self.trend_enabled else "EMA-фильтр отключён, ")
+        self.log(f"Статистика за {self.day.strftime('%d.%m.%Y')}: "
+                 f"сигналов SFP — {self.stat_signals}, {trend_part}"
+                 f"входов — {self.stat_entries}. "
+                 f"Сделки: СТОП — {o['СТОП']}, БЕЗУБЫТОК — {o['БЕЗУБЫТОК']}, "
+                 f"полный тейк — {o['ТЕЙК-ПОЛНЫЙ']}, прочее — {o['ПРОЧЕЕ']}. "
+                 f"Суммарно за день: {self.stat_r:+.2f}R")
+
+    def close_stats(self, symbol, p, category, cur=None):
+        """Учитывает закрытую сделку в дневной статистике: категория и R.
+        R = вклад исполненных тейков + результат закрытия остатка.
+        Если текущая цена известна — остаток считается по ней, иначе
+        по консервативной оценке категории."""
+        filled = sum(p["tp_filled"])
+        r_total = sum(TP_R_CONTRIB[i] for i in range(filled))
+        remaining = (3 - filled) / 3.0
+        risk = p.get("risk") or 0.0
+        if cur is not None and risk > 0 and remaining > 0:
+            if p["side"] == "LONG":
+                r_close = (cur - p["entry"]) / risk
+            else:
+                r_close = (p["entry"] - cur) / risk
         else:
-            self.log(f"Статистика за {self.day.strftime('%d.%m.%Y')}: "
-                     f"сигналов SFP — {self.stat_signals}, "
-                     f"EMA-фильтр отключён, входов — {self.stat_entries}")
+            # консервативная оценка без известной цены закрытия
+            r_close = -1.0 if category == "СТОП" else 0.0
+        r_total += remaining * r_close
+        self.stat_out[category] = self.stat_out.get(category, 0) + 1
+        self.stat_r += r_total
+        self.log(f"Итог сделки {symbol}: {category}, "
+                 f"результат {r_total:+.2f}R "
+                 f"(тейков исполнено: {filled}/3, за день {self.stat_r:+.2f}R)")
+
+    def reset_daily_stats(self):
+        """Сброс дневных счётчиков: лимит стопов, сигналы, исходы сделок."""
+        self.day = dt.date.today()
+        self.losses_today = 0
+        self.stat_signals = 0
+        self.stat_skipped = 0
+        self.stat_entries = 0
+        self.last_stat_hour = None
+        self.stat_out = {"СТОП": 0, "БЕЗУБЫТОК": 0,
+                         "ТЕЙК-ПОЛНЫЙ": 0, "ПРОЧЕЕ": 0}
+        self.stat_r = 0.0
+        self.persist_losses()
 
     def cleanup_orders(self, symbol):
         """Снимает все оставшиеся reduce-only ордера по паре
@@ -668,6 +713,7 @@ class Bot:
             q3 = self.api.qty_ok(sym, qty - 2 * q1, price=entry) if q1 > 0 else 0.0
             self.positions[sym] = {
                 "side": side, "entry": entry, "stop_price": stop,
+                "risk": abs(entry - stop),
                 "stop_id": None, "tp_levels": tps,
                 "tp_filled": [False, False, False],
                 "qty_total": qty, "qty": qty,
@@ -773,14 +819,8 @@ class Bot:
         """Сопровождение открытых позиций: тейки, переносы стопов,
         закрытия. Выполняется каждые FAST_PERIOD секунд."""
         if self.day != dt.date.today():
-            # новый день: сброс лимита стопов и дневной статистики
-            self.day = dt.date.today()
-            self.losses_today = 0
-            self.stat_signals = 0
-            self.stat_skipped = 0
-            self.stat_entries = 0
-            self.last_stat_hour = None
-            self.persist_losses()
+            # новый день: сброс лимита стопов и всей дневной статистики
+            self.reset_daily_stats()
 
         try:
             open_pos = self.api.open_positions()
@@ -810,15 +850,19 @@ class Bot:
                     self.losses_today += 1
                     self.persist_losses()
                     self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
+                    self.close_stats(symbol, p, "СТОП", cur)
                 elif stopped:
                     self.log(f"{symbol}: позиция закрыта по перенесённому стопу — "
                              f"безубыток/профит, в счёт стопов не идёт")
+                    self.close_stats(symbol, p, "БЕЗУБЫТОК", cur)
                 elif cur is not None and (
                         (p["side"] == "LONG" and cur >= p["tp_levels"][2]) or
                         (p["side"] == "SHORT" and cur <= p["tp_levels"][2])):
                     self.log(f"Полный тейк по {symbol}: все 3 тейка отработаны")
+                    self.close_stats(symbol, p, "ТЕЙК-ПОЛНЫЙ", cur)
                 else:
                     self.log(f"{symbol}: позиция закрыта на бирже")
+                    self.close_stats(symbol, p, "ПРОЧЕЕ", cur)
                 # позиция закрыта — снимаем оставшиеся стоп/тейк-ордера
                 self.cleanup_orders(symbol)
                 del self.positions[symbol]
@@ -840,6 +884,7 @@ class Bot:
                         self.move_stop(symbol, p, p["tp_levels"][0], info["qty"])
                 if filled_now >= 3:
                     self.log(f"{symbol}: все 3 тейка отработали, позиция закрыта")
+                    self.close_stats(symbol, p, "ТЕЙК-ПОЛНЫЙ")
                     # снимаем оставшийся висящий стоп-ордер
                     self.cleanup_orders(symbol)
                     del self.positions[symbol]
@@ -866,9 +911,11 @@ class Bot:
                             self.persist_losses()
                             self.log(f"СТОП по {symbol} (резервное закрытие). "
                                      f"Стопов за день: {self.losses_today}")
+                            self.close_stats(symbol, p, "СТОП", cur)
                         else:
                             self.log(f"{symbol}: резервное закрытие — "
                                      f"безубыток/профит, в счёт стопов не идёт")
+                            self.close_stats(symbol, p, "БЕЗУБЫТОК", cur)
                         # снимаем оставшиеся тейк-ордера
                         self.cleanup_orders(symbol)
                         del self.positions[symbol]
@@ -931,6 +978,7 @@ class Bot:
 
             self.positions[symbol] = {
                 "side": side, "entry": entry, "stop_price": stop,
+                "risk": abs(entry - stop),
                 "stop_id": None, "tp_levels": tps,
                 "tp_filled": [False, False, False],
                 "qty_total": qty, "qty": qty,
