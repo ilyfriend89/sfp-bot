@@ -517,6 +517,18 @@ class Bot:
         except Exception:
             pass
 
+    def cleanup_orders(self, symbol):
+        """Снимает все оставшиеся reduce-only ордера по паре
+        (стопы и неисполненные тейки) после закрытия позиции."""
+        try:
+            oids = self.api.open_reduce_orders(symbol)
+        except Exception as ex:
+            self.log(f"{symbol}: не удалось получить ордера для снятия — {ex}")
+            return
+        for oid in oids:
+            if self.api.cancel(symbol, oid):
+                self.log(f"{symbol}: снят оставшийся ордер {oid}")
+
     def place_stop(self, symbol, p, qty, stop_price):
         """Ставит биржевой стоп-ордер, возвращает его ID или None."""
         try:
@@ -687,6 +699,8 @@ class Bot:
                     self.log(f"Полный тейк по {symbol}: все 3 тейка отработаны")
                 else:
                     self.log(f"{symbol}: позиция закрыта на бирже")
+                # позиция закрыта — снимаем оставшиеся стоп/тейк-ордера
+                self.cleanup_orders(symbol)
                 del self.positions[symbol]
                 continue
 
@@ -706,6 +720,8 @@ class Bot:
                         self.move_stop(symbol, p, p["tp_levels"][0], info["qty"])
                 if filled_now >= 3:
                     self.log(f"{symbol}: все 3 тейка отработали, позиция закрыта")
+                    # снимаем оставшийся висящий стоп-ордер
+                    self.cleanup_orders(symbol)
                     del self.positions[symbol]
                     continue
             p["qty"] = info["qty"]
@@ -727,6 +743,8 @@ class Bot:
                         self.persist_losses()
                         self.log(f"СТОП по {symbol} (резервное закрытие). "
                                  f"Стопов за день: {self.losses_today}")
+                        # снимаем оставшиеся тейк-ордера
+                        self.cleanup_orders(symbol)
                         del self.positions[symbol]
                     except Exception as ex:
                         self.log(f"{symbol}: не удалось закрыть — {ex}")
