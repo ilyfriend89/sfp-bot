@@ -148,7 +148,8 @@ class BybitAPI:
 
     def _load_lots(self):
         """Правила инструментов: минимум объёма, шаг объёма, шаг цены,
-        максимум рыночного ордера."""
+        максимум рыночного ордера. При сбое запроса кэш не заполняется —
+        следующая попытка сделает запрос заново."""
         if self._lots is not None:
             return self._lots
         try:
@@ -166,11 +167,36 @@ class BybitAPI:
                 }
             self._lots = lots
         except Exception:
-            self._lots = {}
-        return self._lots
+            self._lots = None
+        return self._lots or {}
+
+    def lot_info(self, symbol):
+        """Правила инструмента. Если полного списка нет — точечный запрос
+        по конкретному символу с догрузкой в кэш."""
+        info = self._load_lots().get(self.sym(symbol))
+        if info is not None:
+            return info
+        try:
+            d = self.req("GET", "/v5/market/instruments-info",
+                         {"category": "linear", "symbol": self.sym(symbol)})
+            for it in d.get("list", []):
+                f = it.get("lotSizeFilter", {})
+                pf = it.get("priceFilter", {})
+                info = {
+                    "min": float(f.get("minOrderQty") or 0),
+                    "qstep": float(f.get("qtyStep") or 0),
+                    "tick": float(pf.get("tickSize") or 0),
+                    "max": float(f.get("maxMktOrderQty") or 0),
+                }
+                if self._lots is None:
+                    self._lots = {}
+                self._lots[it["symbol"]] = info
+        except Exception:
+            return None
+        return info
 
     def qty_ok(self, symbol, qty, price=None):
-        info = self._load_lots().get(self.sym(symbol))
+        info = self.lot_info(symbol)
         if not info:
             return round(qty, 3)
         qty = round_step(qty, info["qstep"])
@@ -179,7 +205,7 @@ class BybitAPI:
         return qty if qty >= info["min"] else 0.0
 
     def price_ok(self, symbol, price):
-        info = self._load_lots().get(self.sym(symbol))
+        info = self.lot_info(symbol)
         if not info or not info.get("tick"):
             return round(price, 6)
         return round_step(price, info["tick"])
@@ -345,7 +371,8 @@ class BingXAPI:
 
     def _load_lots(self):
         """quantityPrecision — знаки после запятой, шаг = 10^-precision.
-        Плюс шаг цены и минимум в деньгах tradeMinUSDT."""
+        Плюс шаг цены и минимум в деньгах tradeMinUSDT.
+        При сбое запроса кэш не заполняется — повтор на следующем вызове."""
         if self._lots is not None:
             return self._lots
         try:
@@ -369,11 +396,15 @@ class BingXAPI:
                 }
             self._lots = lots
         except Exception:
-            self._lots = {}
-        return self._lots
+            self._lots = None
+        return self._lots or {}
 
     def qty_ok(self, symbol, qty, price=None):
         info = self._load_lots().get(self.sym(symbol))
+        if info is None:
+            # повторная загрузка правил — прошлый запрос мог упасть
+            self._lots = None
+            info = self._load_lots().get(self.sym(symbol))
         if not info:
             return round(qty, 3)
         qty = round_step(qty, info["qstep"])
@@ -385,6 +416,9 @@ class BingXAPI:
 
     def price_ok(self, symbol, price):
         info = self._load_lots().get(self.sym(symbol))
+        if info is None:
+            self._lots = None
+            info = self._load_lots().get(self.sym(symbol))
         if not info or not info.get("tick"):
             return round(price, 6)
         return round_step(price, info["tick"])
@@ -518,6 +552,11 @@ class Bot:
         self.day = dt.date.today()
         self.losses_today = 0
         self.positions = {}
+        # дневная статистика сигналов (не переживает перезапуск)
+        self.stat_signals = 0   # SFP-сигналы, прошедшие объём и килл-зону
+        self.stat_skipped = 0   # из них отсечено EMA-фильтром
+        self.stat_entries = 0   # реальных входов в сделку
+        self.last_stat_hour = None
 
     def load_losses(self):
         if not self._load_state:
@@ -539,6 +578,22 @@ class Bot:
                               "losses": self.losses_today})
         except Exception:
             pass
+
+    def log_stats_if_due(self):
+        """Раз в час пишет сводку по сигналам за текущее число."""
+        hour = dt.datetime.now().hour
+        if self.last_stat_hour is not None and hour == self.last_stat_hour:
+            return
+        self.last_stat_hour = hour
+        if self.trend_enabled:
+            self.log(f"Статистика за {self.day.strftime('%d.%m.%Y')}: "
+                     f"сигналов SFP — {self.stat_signals}, "
+                     f"пропущено EMA — {self.stat_skipped}, "
+                     f"входов — {self.stat_entries}")
+        else:
+            self.log(f"Статистика за {self.day.strftime('%d.%m.%Y')}: "
+                     f"сигналов SFP — {self.stat_signals}, "
+                     f"EMA-фильтр отключён, входов — {self.stat_entries}")
 
     def cleanup_orders(self, symbol):
         """Снимает все оставшиеся reduce-only ордера по паре
@@ -696,7 +751,13 @@ class Bot:
 
     def tick(self):
         if self.day != dt.date.today():
-            self.day, self.losses_today = dt.date.today(), 0
+            # новый день: сброс лимита стопов и дневной статистики
+            self.day = dt.date.today()
+            self.losses_today = 0
+            self.stat_signals = 0
+            self.stat_skipped = 0
+            self.stat_entries = 0
+            self.last_stat_hour = None
             self.persist_losses()
 
         try:
@@ -797,6 +858,7 @@ class Bot:
         if len(self.positions) >= self.max_positions:
             return
 
+        scanned_any_signal = False
         for symbol in self.symbols:
             if self.stop_event.is_set():
                 break
@@ -811,9 +873,12 @@ class Bot:
                 continue
             if not side:
                 continue
+            self.stat_signals += 1
+            scanned_any_signal = True
 
             # EMA-фильтр тренда: сигналы против тренда отбрасываются
             if not self.trend_ok(symbol, side):
+                self.stat_skipped += 1
                 if self.trend_enabled:
                     self.log(f"{symbol}: SFP {side} против тренда "
                              f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
@@ -838,6 +903,7 @@ class Bot:
             except Exception as ex:
                 self.log(f"{symbol}: вход не прошёл — {ex}")
                 continue
+            self.stat_entries += 1
 
             self.positions[symbol] = {
                 "side": side, "entry": entry, "stop_price": stop,
@@ -866,6 +932,10 @@ class Bot:
                 self.log(f"{symbol}: треть объёма ниже минимума биржи — "
                          f"тейки не выставлены, сопровождение по стопу")
             break
+
+        if scanned_any_signal:
+            # сводка пишется не чаще раза в час при наличии сигналов за день
+            self.log_stats_if_due()
 
 
 def tg_send(cfg, text):
