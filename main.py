@@ -441,12 +441,19 @@ class BingXAPI:
                      {"symbol": self.fmt(symbol)})
         return float(d[0]["lastPrice"])
 
-    def balance(self):
+        def balance(self):
         try:
             d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-            for coin in d:
-                if coin.get("coin") == "USDT":
-                    return float(coin.get("balance") or 0)
+            # BingX возвращает data объектом с полями баланса, а не списком монет
+            if isinstance(d, dict):
+                for key in ("balance", "usableMargin", "accountMargin"):
+                    if d.get(key) not in (None, ""):
+                        return float(d[key])
+            elif isinstance(d, list):
+                # старый формат на всякий случай
+                for coin in d:
+                    if coin.get("coin") == "USDT":
+                        return float(coin.get("balance") or 0)
         except Exception:
             pass
         return 0.0
