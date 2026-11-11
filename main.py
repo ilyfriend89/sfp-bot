@@ -46,6 +46,9 @@ BINGX_ALIASES = {
 EMA_PERIOD = 50      # период EMA для фильтра тренда
 EMA_OFF = "Выключен" # значение тренд-ТФ, отключающее фильтр
 
+# сопровождение позиций: опрос каждые N секунд; сигналы — раз в минуту
+FAST_PERIOD = 5      # проверка позиций каждые 5 секунд
+
 
 def state_load():
     """Читает всё хранилище (профили, последний профиль, счётчик стопов)."""
@@ -729,7 +732,8 @@ class Bot:
             trend_info = "EMA-фильтр выключен"
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
                  f"(фильтр объёма ×{self.vol_mult}), {trend_info}. "
-                 f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}")
+                 f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}. "
+                 f"Позиции проверяются каждые {FAST_PERIOD} сек")
         self.log(MOSCOW_HINT)
         try:
             bal = self.api.balance()
@@ -737,19 +741,30 @@ class Bot:
         except Exception as ex:
             self.log(f"[API FAIL] Баланс не получен: {ex}")
         self.recover()
+        loop_count = 0
         while not self.stop_event.is_set():
+            # быстрый контур: сопровождение позиций каждые 5 секунд
             try:
-                self.tick()
-                self.log(f"Цикл выполнен. Открытых позиций: {len(self.positions)}")
+                self.manage_positions()
             except Exception as ex:
-                self.log(f"Ошибка: {ex}")
-            for _ in range(60):
+                self.log(f"Ошибка сопровождения позиций: {ex}")
+            loop_count += 1
+            # медленный контур: сканирование сигналов раз в минуту
+            if loop_count % 12 == 0:
+                try:
+                    self.scan_signals()
+                    self.log(f"Цикл выполнен. Открытых позиций: {len(self.positions)}")
+                except Exception as ex:
+                    self.log(f"Ошибка: {ex}")
+            for _ in range(FAST_PERIOD):
                 if self.stop_event.is_set():
                     break
                 time.sleep(1)
         self.log("Бот остановлен")
 
-    def tick(self):
+    def manage_positions(self):
+        """Сопровождение открытых позиций: тейки, переносы стопов,
+        закрытия. Выполняется каждые FAST_PERIOD секунд."""
         if self.day != dt.date.today():
             # новый день: сброс лимита стопов и дневной статистики
             self.day = dt.date.today()
@@ -853,6 +868,8 @@ class Bot:
                     except Exception as ex:
                         self.log(f"{symbol}: не удалось закрыть — {ex}")
 
+    def scan_signals(self):
+        """Сканирование пар на SFP-сигналы. Выполняется раз в минуту."""
         if self.losses_today >= self.max_losses:
             return
         if len(self.positions) >= self.max_positions:
