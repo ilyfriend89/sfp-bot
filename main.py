@@ -1,8 +1,18 @@
+# -*- coding: utf-8 -*-
+# ======================================================================
+#  ВНИМАНИЕ: ТОРГОВАТЬ ТОЛЬКО ИЗОЛИРОВАННОЙ МАРЖОЙ (ISOLATED) С ПЛЕЧОМ 5x
+#  Размер позиции бот считает из риска (1% на сделку) — плечо в приложении
+#  биржи задаёт только объём залога под позицию.
+# ======================================================================
+
 import time, hmac, hashlib, urllib.parse, threading, json, os
 import datetime as dt
 from decimal import Decimal, ROUND_DOWN
 import requests
 import flet as ft
+
+WARNING_ISOLATED = ("⚠️ ТОРГОВАТЬ ТОЛЬКО ИЗОЛИРОВАННОЙ МАРЖОЙ (ISOLATED) С ПЛЕЧОМ 5x. "
+                    "Размер позиции считает бот из риска — плечо задаёт только залог.")
 
 BYBIT_REAL = "https://api.bybit.com"
 BYBIT_DEMO = "https://api-demo.bybit.com"
@@ -13,18 +23,22 @@ BINGX_DEMO = "https://open-api-vst.bingx.com"
 STATE_FILE = os.path.join(os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd(),
                           "sfp_state.json")
 
-MOSCOW_HINT = ("⏰ По Москве: кил-зоны 10:00–13:00 и 16:00–19:00. "
-               "Бот включайте с 9:30 до 19:00 по МСК, в остальное время сигналов не будет.")
+MOSCOW_HINT = ("⏰ По Москве: килл-зоны 10:00–13:00 и 16:00–22:00. "
+               "Бот включайте с 9:30 до 22:00 по МСК, в остальное время сигналов не будет.")
 
 TIMEFRAMES = {
     "1 минута": {"interval_bybit": "1",   "interval_bingx": "1m",  "vol_mult": 3.0},
     "5 минут":  {"interval_bybit": "5",   "interval_bingx": "5m",  "vol_mult": 2.8},
-    "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
+    "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 3.5},
     "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
     "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
     "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
     "1 день":   {"interval_bybit": "D",   "interval_bingx": "1d",  "vol_mult": 1.2},
 }
+
+# длительность свечи в минутах — для расчёта ожидания лимит-входа
+TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 минут": 30,
+              "1 час": 60, "4 часа": 240, "1 день": 1440}
 
 # порядок ТФ по возрастанию — для проверки «тренд крупнее рабочего»
 TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут",
@@ -45,21 +59,28 @@ BINGX_ALIASES = {
     "BONKUSDT":  "BONKUSDT",
     "FLOKIUSDT": "FLOKIUSDT",
     "SHIBUSDT":  "SHIBUSDT",
-    "PUMPUSDT":  "PUMPUSDT",
+    "PUMPUSDT":  "1000PUMPUSDT",
     "WLFIUSDT":  "WLFIUSDT",
     "WIFUSDT":   "WIFUSDT",
 }
 
-EMA_PERIOD = 50      # период EMA для фильтра тренда
+EMA_PERIOD = 50      # период EMA для фильтра тренда (конфиг: EMA50 на 1H)
 EMA_OFF = "Выключен" # значение тренд-ТФ, отключающее фильтр
 TREND_CACHE_TTL = 60 # кэш EMA по парам, секунд
 
 # сопровождение позиций: опрос каждые N секунд; сигналы — раз в минуту
 FAST_PERIOD = 5      # проверка позиций каждые 5 секунд
 
-# вклад каждого исполненного тейка в итог сделки (в R):
-# тейк i закрывает 1/3 объёма на расстоянии 1.9*(i/3)*r от входа
-TP_R_CONTRIB = [1.9 * (i + 1) / 9.0 for i in range(3)]  # 0.211, 0.422, 0.633
+# ---- зафиксированная конфигурация (результат бэктестов v9) ----
+# уровни тейков 0.63 / 1.27 / 1.9 R, доли объёма 1/2, 1/4, 1/4;
+# вклад каждого тейка в итог полной сделки (в R):
+TP_OFFSETS = (1.9 / 3, 2 * 1.9 / 3, 1.9)                      # 0.633, 1.267, 1.9
+TP_SPLIT = (0.5, 0.25, 0.25)                                   # доли позиции
+TP_R_CONTRIB = [o * w for o, w in zip(TP_OFFSETS, TP_SPLIT)]   # 0.317, 0.317, 0.475
+RISK_CAP_LEVERAGE = 10.0   # лимит расчёта бота (в приложении биржи — 5x Isolated)
+MIN_STOP_PCT = 0.8         # стоп ближе 0.8% — сигнал пропускаем («пыль»)
+MAX_STOPS_PER_PAIR = 3     # стопов на одну пару в день
+ENTRY_WAIT = 3             # свечей на исполнение лимит-входа (иначе отмена)
 
 
 def state_load():
@@ -97,7 +118,7 @@ def qstr(x):
 
 def calc_3tp(entry, stop, side):
     """Три тейка на равном расстоянии. Полная цель по цене — 1.9R.
-    Взвешенный результат полной сделки — около +1.27R.
+    Взвешенный результат полной сделки — около +1.11R (доли 1/2, 1/4, 1/4).
     Возвращает [tp1, tp2, tp3]."""
     r = abs(entry - stop)
     if r <= 0:
@@ -550,6 +571,9 @@ class Bot:
         self.api = api
         self.tf_label = tf_label
         self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
+        # deposit_pct — ДОЛЯ РИСКА на сделку (0.01 = 1% баланса в стопе),
+        # объём позиции считается от расстояния до стопа, не от депозита
+        self.deposit_pct = deposit_pct
         # фильтр тренда по EMA; можно полностью выключить выбором EMA_OFF
         self.trend_label = trend_label
         self.trend_enabled = (trend_label != EMA_OFF)
@@ -564,8 +588,7 @@ class Bot:
             self.trend_interval = None
         self.trend_cache = {}  # symbol -> (timestamp, ema_value)
         self.symbols = symbols
-        self.deposit_pct = deposit_pct
-        self.max_losses = max_losses_per_day
+        self.max_losses = max_losses_per_day   # на корзину в день
         self.max_positions = max_positions
         self.log = log
         self._load_state = load_state
@@ -573,11 +596,12 @@ class Bot:
         self.stop_event = threading.Event()
         self.day = dt.date.today()
         self.losses_today = 0
+        self.losses_by_pair = {}   # symbol -> стопов за сегодня (лимит 3/пара)
         self.positions = {}
         # дневная статистика сигналов (не переживает перезапуск)
         self.stat_signals = 0   # SFP-сигналы, прошедшие объём и килл-зону
         self.stat_skipped = 0   # из них отсечено EMA-фильтром
-        self.stat_entries = 0   # реальных входов в сделку
+        self.stat_entries = 0   # реальных входов в сделку (исполненный лимит)
         self.last_stat_hour = None
         # статистика исходов сделок за день
         self.stat_out = {"СТОП": 0, "БЕЗУБЫТОК": 0,
@@ -592,6 +616,7 @@ class Bot:
             st = self._load_state()
             if st and st.get("date") == dt.date.today().isoformat():
                 self.losses_today = int(st.get("losses", 0))
+                self.losses_by_pair = dict(st.get("losses_by_pair") or {})
                 if self.losses_today:
                     self.log(f"Восстановлен счётчик стопов за сегодня: {self.losses_today}")
         except Exception:
@@ -602,7 +627,8 @@ class Bot:
             return
         try:
             self._save_state({"date": dt.date.today().isoformat(),
-                              "losses": self.losses_today})
+                              "losses": self.losses_today,
+                              "losses_by_pair": self.losses_by_pair})
         except Exception:
             pass
 
@@ -625,11 +651,11 @@ class Bot:
 
     def close_stats(self, symbol, p, category, cur=None):
         """Учитывает закрытую сделку в дневной статистике: категория, R и USDT.
-        R = вклад исполненных тейков + результат закрытия остатка.
-        R в деньгах = расстояние до стопа * полный объём позиции (на момент входа)."""
+        R = вклад исполненных тейков (доли 1/2, 1/4, 1/4) + результат закрытия
+        остатка. R в деньгах = расстояние до стопа * полный объём позиции."""
         filled = sum(p["tp_filled"])
-        r_total = sum(TP_R_CONTRIB[i] for i in range(filled))
-        remaining = (3 - filled) / 3.0
+        r_total = sum(TP_R_CONTRIB[:filled])
+        remaining = 1.0 - sum(TP_SPLIT[:filled])
         risk = p.get("risk") or 0.0
         if cur is not None and risk > 0 and remaining > 0:
             if p["side"] == "LONG":
@@ -656,6 +682,7 @@ class Bot:
         """Сброс дневных счётчиков: лимит стопов, сигналы, исходы сделок."""
         self.day = dt.date.today()
         self.losses_today = 0
+        self.losses_by_pair = {}
         self.stat_signals = 0
         self.stat_skipped = 0
         self.stat_entries = 0
@@ -706,6 +733,31 @@ class Bot:
             self.log(f"{symbol}: перенос стопа не удался — старый стоп "
                      f"мог остаться, проверьте вручную")
 
+    def place_tps(self, symbol, p):
+        """Три лимитных тейк-ордера долями 1/2, 1/4, 1/4 (последний — остаток)."""
+        side = p["side"]
+        qty = p["qty_total"]
+        placed = 0
+        q_left = qty
+        for i, (w, tp) in enumerate(zip(TP_SPLIT, p["tp_levels"])):
+            if i < len(TP_SPLIT) - 1:
+                q = self.api.qty_ok(symbol, qty * w, price=p["entry"])
+            else:
+                q = self.api.qty_ok(symbol, q_left, price=p["entry"])
+            if q <= 0:
+                self.log(f"{symbol}: тейк {i + 1} ниже минимума биржи — пропущен")
+                continue
+            try:
+                self.api.order(symbol, "Sell" if side == "LONG" else "Buy",
+                               q, tp=tp, reduce_only=True)
+                placed += 1
+            except Exception as ex:
+                self.log(f"{symbol}: тейк {i + 1} не выставлен — {ex}")
+            q_left -= q
+        if placed == 0:
+            self.log(f"{symbol}: тейки не выставлены — сопровождение по стопу")
+        return placed
+
     def recover(self):
         try:
             open_pos = self.api.open_positions()
@@ -725,9 +777,8 @@ class Bot:
                 self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
             stop = self.api.price_ok(sym, stop)
             tps = [self.api.price_ok(sym, t) for t in calc_3tp(entry, stop, side)]
-            q1 = self.api.qty_ok(sym, qty / 3, price=entry)
-            q3 = self.api.qty_ok(sym, qty - 2 * q1, price=entry) if q1 > 0 else 0.0
             self.positions[sym] = {
+                "phase": "ACTIVE",
                 "side": side, "entry": entry, "stop_price": stop,
                 "risk": abs(entry - stop),
                 "stop_id": None, "tp_levels": tps,
@@ -735,13 +786,7 @@ class Bot:
                 "qty_total": qty, "qty": qty,
             }
             self.positions[sym]["stop_id"] = self.place_stop(sym, self.positions[sym], qty, stop)
-            if q1 > 0 and q3 > 0:
-                for i, (q, tp) in enumerate(((q1, tps[0]), (q1, tps[1]), (q3, tps[2]))):
-                    try:
-                        self.api.order(sym, "Sell" if side == "LONG" else "Buy",
-                                       q, tp=tp, reduce_only=True)
-                    except Exception as ex:
-                        self.log(f"{sym}: тейк {i+1} не выставлен — {ex}")
+            self.place_tps(sym, self.positions[sym])
             self.log(f"Восстановлена позиция {side} {sym} по {qstr(entry)}, "
                      f"объём {qstr(qty)}: стоп {qstr(stop)}, "
                      f"тейки {qstr(tps[0])} / {qstr(tps[1])} / {qstr(tps[2])}")
@@ -804,7 +849,8 @@ class Bot:
         avg_vol = sum(x[4] for x in c[-21:-1]) / 20
 
         now = dt.datetime.utcnow()
-        kill_zone = (7 <= now.hour < 10) or (13 <= now.hour < 16)
+        # килл-зоны по Москве 10:00–13:00 и 16:00–22:00 = UTC 7–10 и 13–19
+        kill_zone = (7 <= now.hour < 10) or (13 <= now.hour < 19)
 
         long_sig = (last[2] < prev[2] and
                     last[3] > prev[2] and
@@ -830,8 +876,15 @@ class Bot:
                 trend_info += ", фильтр «у EMA» выключен"
         else:
             trend_info = "EMA-фильтр выключен"
+        self.log(WARNING_ISOLATED)
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
                  f"(фильтр объёма ×{self.vol_mult}), {trend_info}. "
+                 f"Вход лимитом, ожидание {ENTRY_WAIT} свечей. "
+                 f"Риск {self.deposit_pct * 100:.1f}% на сделку "
+                 f"(плечо расчёта до x{RISK_CAP_LEVERAGE:.0f}). "
+                 f"Тейки 0.63/1.27/1.9R долями 1/2, 1/4, 1/4; "
+                 f"стоп после ТП1 — безубыток, после ТП2 — на ТП1. "
+                 f"Лимиты стопов: {MAX_STOPS_PER_PAIR}/пара, {self.max_losses}/корзина в день. "
                  f"Пары: {', '.join(self.symbols)}. Лимит позиций: {self.max_positions}. "
                  f"Позиции проверяются каждые {FAST_PERIOD} сек")
         self.log(MOSCOW_HINT)
@@ -877,6 +930,33 @@ class Bot:
 
         for symbol in list(self.positions):
             p = self.positions[symbol]
+
+            # ---- ожидание исполнения лимит-входа ----
+            if p.get("phase") == "WAIT_FILL":
+                filled = open_pos.get(symbol) if open_pos is not None else None
+                if filled is not None:
+                    # вход исполнился: снимаем остаток лимита, ставим защиту
+                    if p.get("order_id"):
+                        self.api.cancel(symbol, p["order_id"])
+                    qty = filled["qty"]
+                    p["qty_total"] = qty
+                    p["qty"] = qty
+                    p["stop_id"] = self.place_stop(symbol, p, qty, p["stop_price"])
+                    self.place_tps(symbol, p)
+                    p["phase"] = "ACTIVE"
+                    self.stat_entries += 1
+                    self.log(f"ВХОД исполнен {p['side']} {symbol} по "
+                             f"{qstr(filled.get('entry') or p['entry'])}, "
+                             f"стоп {qstr(p['stop_price'])}, защита выставлена")
+                elif time.time() > p["placed_ts"] + \
+                        ENTRY_WAIT * TF_MINUTES.get(self.tf_label, 15) * 60:
+                    if p.get("order_id"):
+                        self.api.cancel(symbol, p["order_id"])
+                    self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} свечей — "
+                             f"сигнал пропущен (не догоняем рынок)")
+                    del self.positions[symbol]
+                continue
+
             info = open_pos.get(symbol) if open_pos is not None else None
 
             if info is None:
@@ -895,6 +975,7 @@ class Bot:
                                (p["side"] == "SHORT" and cur > p["entry"])))
                 if stopped and loss_close:
                     self.losses_today += 1
+                    self.losses_by_pair[symbol] = self.losses_by_pair.get(symbol, 0) + 1
                     self.persist_losses()
                     self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
                     self.close_stats(symbol, p, "СТОП", cur)
@@ -915,9 +996,15 @@ class Bot:
                 del self.positions[symbol]
                 continue
 
-            # сколько тейков сработало на бирже (по уменьшению объёма)
-            filled_now = int(round(
-                (p["qty_total"] - info["qty"]) / p["qty_total"] * 3))
+            # сколько тейков сработало на бирже — по накопленным долям объёма
+            # (доли неравные: 1/2, 1/4, 1/4 — порог 0.5 / 0.75 / 1.0)
+            closed_frac = (p["qty_total"] - info["qty"]) / p["qty_total"]
+            filled_now = 0
+            cum = 0.0
+            for w in TP_SPLIT:
+                cum += w
+                if closed_frac + 0.06 >= cum:
+                    filled_now += 1
             filled_now = max(0, min(3, filled_now))
             newly = filled_now - sum(p["tp_filled"])
             if newly > 0:
@@ -955,6 +1042,7 @@ class Bot:
                                       (p["side"] == "SHORT" and cur > p["entry"]))
                         if loss_close:
                             self.losses_today += 1
+                            self.losses_by_pair[symbol] = self.losses_by_pair.get(symbol, 0) + 1
                             self.persist_losses()
                             self.log(f"СТОП по {symbol} (резервное закрытие). "
                                      f"Стопов за день: {self.losses_today}")
@@ -984,6 +1072,9 @@ class Bot:
                 continue
             if len(self.positions) >= self.max_positions:
                 break
+            # лимит стопов на пару: 3 в день
+            if self.losses_by_pair.get(symbol, 0) >= MAX_STOPS_PER_PAIR:
+                continue
             try:
                 side, stop_lvl = self.sfp_signal(symbol)
             except Exception as ex:
@@ -1002,54 +1093,57 @@ class Bot:
                              f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
                 continue
 
-            entry = self.api.price(symbol)
+            entry = self.api.price_ok(symbol, self.api.price(symbol))
             stop = self.api.price_ok(symbol, stop_lvl)
-            raw_qty = self.api.balance() * self.deposit_pct / entry
-            if raw_qty <= 0:
+            risk = abs(entry - stop)
+            if risk <= 0:
                 continue
+            stop_pct = risk / entry * 100.0
+            # минимальный размер стопа: «пыльные» стопы пропускаем
+            if stop_pct < MIN_STOP_PCT:
+                self.log(f"{symbol}: стоп {stop_pct:.2f}% — ближе минимальных "
+                         f"{MIN_STOP_PCT}% — сигнал пропущен")
+                continue
+
+            # объём из риска: позиция = баланс × риск / (стоп в долях цены),
+            # но не больше баланс × RISK_CAP_LEVERAGE
+            bal = self.api.balance()
+            if bal <= 0:
+                continue
+            notional = bal * self.deposit_pct / (risk / entry)
+            notional = min(notional, bal * RISK_CAP_LEVERAGE)
+            raw_qty = notional / entry
             qty = self.api.qty_ok(symbol, raw_qty, price=entry)
             if qty <= 0:
                 self.log(f"{symbol}: объём {raw_qty:.6f} меньше минимума биржи — пропущено")
                 continue
 
             tps = [self.api.price_ok(symbol, t) for t in calc_3tp(entry, stop, side)]
-            q1 = self.api.qty_ok(symbol, qty / 3, price=entry)
-            q3 = self.api.qty_ok(symbol, qty - 2 * q1, price=entry) if q1 > 0 else 0.0
 
+            # мейкер-вход: лимитный ордер по текущей цене; не исполнился за
+            # ENTRY_WAIT свечей — снимаем и не догоняем рынком
             try:
-                self.api.order(symbol, "Buy" if side == "LONG" else "Sell", qty)
+                res = self.api.order(symbol, "Buy" if side == "LONG" else "Sell",
+                                     qty, tp=entry)
+                oid = res.get("orderId") if isinstance(res, dict) else None
             except Exception as ex:
-                self.log(f"{symbol}: вход не прошёл — {ex}")
+                self.log(f"{symbol}: лимит-вход не выставлен — {ex}")
                 continue
-            self.stat_entries += 1
 
             self.positions[symbol] = {
+                "phase": "WAIT_FILL",
+                "placed_ts": time.time(),
+                "order_id": oid,
                 "side": side, "entry": entry, "stop_price": stop,
-                "risk": abs(entry - stop),
+                "risk": risk,
                 "stop_id": None, "tp_levels": tps,
                 "tp_filled": [False, False, False],
                 "qty_total": qty, "qty": qty,
             }
-            self.log(f"ВХОД {side} {symbol} по {qstr(entry)}, стоп {qstr(stop)}, "
+            self.log(f"ЛИМИТ-ВХОД {side} {symbol} по {qstr(entry)}, "
+                     f"стоп {qstr(stop)} ({stop_pct:.2f}%), "
                      f"тейки: {qstr(tps[0])} / {qstr(tps[1])} / {qstr(tps[2])} "
-                     f"(по 1/3) [{len(self.positions)}/{self.max_positions}]")
-
-            # биржевой стоп на весь объём
-            self.positions[symbol]["stop_id"] = \
-                self.place_stop(symbol, self.positions[symbol], qty, stop)
-
-            # три лимитных тейк-ордера по 1/3 объёма
-            if q1 > 0 and q3 > 0:
-                for i, (q, tp) in enumerate(((q1, tps[0]), (q1, tps[1]), (q3, tps[2]))):
-                    try:
-                        self.api.order(symbol,
-                                       "Sell" if side == "LONG" else "Buy",
-                                       q, tp=tp, reduce_only=True)
-                    except Exception as ex:
-                        self.log(f"{symbol}: тейк {i+1} не выставлен — {ex}")
-            else:
-                self.log(f"{symbol}: треть объёма ниже минимума биржи — "
-                         f"тейки не выставлены, сопровождение по стопу")
+                     f"(1/2, 1/4, 1/4) [{len(self.positions)}/{self.max_positions}]")
             break
 
         if scanned_any_signal:
@@ -1103,11 +1197,11 @@ def main(page: ft.Page):
                        value="Демо")
     tf = ft.Dropdown(label="Таймфрейм",
                      options=[ft.dropdown.Option(k) for k in TIMEFRAMES],
-                     value="4 часа")
+                     value="15 минут")
     trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
                            options=[ft.dropdown.Option(EMA_OFF)] +
                                    [ft.dropdown.Option(k) for k in TIMEFRAMES],
-                           value="1 день")
+                           value="1 час")
     api_key = ft.TextField(label="API-ключ", password=True, can_reveal_password=True)
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
@@ -1118,14 +1212,16 @@ def main(page: ft.Page):
               "XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,"
               "ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,"
               "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT")
-    deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
-    losses = ft.TextField(label="Макс. стопов в день", value="3")
+    deposit = ft.TextField(label="Риск на сделку (0.01 = 1% баланса в стопе)",
+                           value="0.01")
+    losses = ft.TextField(label="Макс. стопов на корзину в день (на пару: 3)",
+                          value="5")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
-    ema_prox = ft.TextField(label="Вход только у EMA (%, 0 = выкл)", value="1.5")
+    ema_prox = ft.TextField(label="Вход только у EMA (%, 0 = выкл)", value="3.0")
     tg_token = ft.TextField(label="Токен Telegram-бота", password=True, can_reveal_password=True)
     tg_chat = ft.TextField(label="Ваш chat_id в Telegram")
 
-    profile_name = ft.TextField(label="Имя профиля", hint_text="например: Bybit-демо-4h")
+    profile_name = ft.TextField(label="Имя профиля", hint_text="например: Bybit-демо-15m")
     profile_dd = ft.Dropdown(
         label="Сохранённые профили",
         options=[ft.dropdown.Option(k) for k in sorted(profiles)],
@@ -1135,6 +1231,13 @@ def main(page: ft.Page):
     moscow_note = ft.Text(MOSCOW_HINT, size=14, weight=ft.FontWeight.BOLD)
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
+
+    warning_banner = ft.Container(
+        content=ft.Text(WARNING_ISOLATED, color=ft.Colors.RED,
+                        weight=ft.FontWeight.BOLD),
+        bgcolor=ft.Colors.RED_100, padding=10, border_radius=6,
+        margin=ft.margin.only(bottom=4),
+    )
 
     btn_start = ft.FilledButton("Запустить", on_click=None, expand=True)
     btn_stop = ft.FilledButton("Остановить", on_click=None, expand=True,
@@ -1271,6 +1374,7 @@ def main(page: ft.Page):
         state["active"] = True
         state["thread"] = threading.Thread(target=bot.run, daemon=True)
         state["thread"].start()
+        add_log(WARNING_ISOLATED)
         status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
         set_buttons(True)
 
@@ -1330,6 +1434,7 @@ def main(page: ft.Page):
     btn_tab_log.on_click = lambda e: show_tab(1)
 
     page.add(ft.Column([
+        warning_banner,
         ft.Row([btn_tab_settings, btn_tab_log]),
         content,
     ], spacing=10, expand=True))
