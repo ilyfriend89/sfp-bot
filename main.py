@@ -1414,7 +1414,7 @@ def main(page: ft.Page):
         content=ft.Text(WARNING_ISOLATED, color=ft.Colors.BLACK,
                         weight=ft.FontWeight.BOLD),
         bgcolor=ft.Colors.GREEN_100, padding=10, border_radius=6,
-        margin=ft.margin.only(bottom=4),
+        margin=ft.Margin(left=0, top=0, right=0, bottom=4),
     )
 
     btn_start = ft.FilledButton("Запустить", on_click=None, expand=True)
