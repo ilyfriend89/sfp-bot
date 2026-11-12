@@ -369,7 +369,7 @@ class BingXAPI:
     def req(self, method, path, params=None):
         qs, headers = self._query(params or {})
         url = f"{self.base}{path}?{qs}"
-        r = requests.post(url, timeout=15) if method == "POST" \
+        r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
             else requests.get(url, headers=headers, timeout=15)
         if not r.text.strip():
             raise RuntimeError("пустой ответ — проверьте ключ и права")
