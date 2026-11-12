@@ -1232,11 +1232,12 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
 
+    # WARNING: без ft.margin.only — в вашей сборке flet этот хелпер отсутствует.
+    # Отступ снизу даём через padding родительской колонки.
     warning_banner = ft.Container(
         content=ft.Text(WARNING_ISOLATED, color=ft.Colors.RED,
                         weight=ft.FontWeight.BOLD),
         bgcolor=ft.Colors.RED_100, padding=10, border_radius=6,
-        margin=ft.margin.only(bottom=4),
     )
 
     btn_start = ft.FilledButton("Запустить", on_click=None, expand=True)
