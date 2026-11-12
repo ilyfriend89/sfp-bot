@@ -17,11 +17,18 @@ MOSCOW_HINT = ("⏰ По Москве: кил-зоны 10:00–13:00 и 16:00–
                "Бот включайте с 9:30 до 19:00 по МСК, в остальное время сигналов не будет.")
 
 TIMEFRAMES = {
-    "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
-    "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
-    "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
+    "1 минута": {"interval_bybit": "1",   "interval_bingx": "1m",  "vol_mult": 3.0},
+    "5 минут":  {"interval_bybit": "5",   "interval_bingx": "5m",  "vol_mult": 2.8},
     "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 2.5},
+    "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
+    "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
+    "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
+    "1 день":   {"interval_bybit": "D",   "interval_bingx": "1d",  "vol_mult": 1.2},
 }
+
+# порядок ТФ по возрастанию — для проверки «тренд крупнее рабочего»
+TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут",
+            "1 час", "4 часа", "1 день"]
 
 BYBIT_ALIASES = {
     "PEPEUSDT":  "1000PEPEUSDT",
@@ -45,6 +52,7 @@ BINGX_ALIASES = {
 
 EMA_PERIOD = 50      # период EMA для фильтра тренда
 EMA_OFF = "Выключен" # значение тренд-ТФ, отключающее фильтр
+TREND_CACHE_TTL = 60 # кэш EMA по парам, секунд
 
 # сопровождение позиций: опрос каждые N секунд; сигналы — раз в минуту
 FAST_PERIOD = 5      # проверка позиций каждые 5 секунд
@@ -89,7 +97,7 @@ def qstr(x):
 
 def calc_3tp(entry, stop, side):
     """Три тейка на равном расстоянии. Полная цель по цене — 1.9R.
-    Взвешенный результат полной сделки — около +1.27R (см. статистику).
+    Взвешенный результат полной сделки — около +1.27R.
     Возвращает [tp1, tp2, tp3]."""
     r = abs(entry - stop)
     if r <= 0:
@@ -379,8 +387,7 @@ class BingXAPI:
 
     def _load_lots(self):
         """quantityPrecision — знаки после запятой, шаг = 10^-precision.
-        Плюс шаг цены и минимум в деньгах tradeMinUSDT.
-        При сбое запроса кэш не заполняется — повтор на следующем вызове."""
+        Плюс шаг цены и минимум в деньгах tradeMinUSDT."""
         if self._lots is not None:
             return self._lots
         try:
@@ -410,7 +417,6 @@ class BingXAPI:
     def qty_ok(self, symbol, qty, price=None):
         info = self._load_lots().get(self.sym(symbol))
         if info is None:
-            # повторная загрузка правил — прошлый запрос мог упасть
             self._lots = None
             info = self._load_lots().get(self.sym(symbol))
         if not info:
@@ -449,13 +455,11 @@ class BingXAPI:
     def balance(self):
         try:
             d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-            # BingX возвращает data объектом с полями баланса, а не списком монет
             if isinstance(d, dict):
                 for key in ("balance", "usableMargin", "accountMargin"):
                     if d.get(key) not in (None, ""):
                         return float(d[key])
             elif isinstance(d, list):
-                # старый формат на всякий случай
                 for coin in d:
                     if coin.get("coin") == "USDT":
                         return float(coin.get("balance") or 0)
@@ -541,6 +545,7 @@ class BingXAPI:
 class Bot:
     def __init__(self, api, tf_label, trend_label, symbols, deposit_pct,
                  max_losses_per_day, max_positions, log,
+                 ema_proximity_pct=0.0,
                  load_state=None, save_state=None):
         self.api = api
         self.tf_label = tf_label
@@ -548,6 +553,8 @@ class Bot:
         # фильтр тренда по EMA; можно полностью выключить выбором EMA_OFF
         self.trend_label = trend_label
         self.trend_enabled = (trend_label != EMA_OFF)
+        # фильтр «Не догоняем»: вход только в пределах N% от EMA50 (0 = выкл)
+        self.ema_proximity_pct = ema_proximity_pct
         if self.trend_enabled:
             if api.base in (BYBIT_REAL, BYBIT_DEMO):
                 self.trend_interval = TIMEFRAMES[trend_label]["interval_bybit"]
@@ -555,6 +562,7 @@ class Bot:
                 self.trend_interval = TIMEFRAMES[trend_label]["interval_bingx"]
         else:
             self.trend_interval = None
+        self.trend_cache = {}  # symbol -> (timestamp, ema_value)
         self.symbols = symbols
         self.deposit_pct = deposit_pct
         self.max_losses = max_losses_per_day
@@ -615,9 +623,7 @@ class Bot:
 
     def close_stats(self, symbol, p, category, cur=None):
         """Учитывает закрытую сделку в дневной статистике: категория и R.
-        R = вклад исполненных тейков + результат закрытия остатка.
-        Если текущая цена известна — остаток считается по ней, иначе
-        по консервативной оценке категории."""
+        R = вклад исполненных тейков + результат закрытия остатка."""
         filled = sum(p["tp_filled"])
         r_total = sum(TP_R_CONTRIB[i] for i in range(filled))
         remaining = (3 - filled) / 3.0
@@ -628,7 +634,6 @@ class Bot:
             else:
                 r_close = (p["entry"] - cur) / risk
         else:
-            # консервативная оценка без известной цены закрытия
             r_close = -1.0 if category == "СТОП" else 0.0
         r_total += remaining * r_close
         self.stat_out[category] = self.stat_out.get(category, 0) + 1
@@ -733,26 +738,52 @@ class Bot:
             self.log(f"Итого восстановлено позиций: {len(open_pos)}")
         self.load_losses()
 
-    def trend_ok(self, symbol, side):
-        """EMA-фильтр тренда по старшему ТФ: LONG — цена выше EMA, SHORT — ниже.
-        Если фильтр выключен в настройках, всегда разрешает вход."""
-        if not self.trend_enabled:
-            return True
+    def get_ema_trend(self, symbol):
+        """EMA50 на тренд-ТФ с кэшем на TREND_CACHE_TTL секунд.
+        Возвращает значение или None при ошибке/нехватке свечей."""
+        now = time.time()
+        cached = self.trend_cache.get(symbol)
+        if cached and now - cached[0] < TREND_CACHE_TTL:
+            return cached[1]
         try:
             c = self.api.candles(symbol, limit=EMA_PERIOD * 2,
                                  interval=self.trend_interval)
         except Exception as ex:
             self.log(f"{symbol}: EMA не получена ({ex}) — сигнал пропущен")
-            return False
+            return None
         closes = [x[3] for x in c]
         e = ema(closes, EMA_PERIOD)
+        if e is not None:
+            self.trend_cache[symbol] = (now, e)
+        return e
+
+    def trend_ok(self, symbol, side):
+        """Фильтр тренда и «Не догоняем»:
+        1) LONG — только выше EMA50, SHORT — только ниже;
+        2) если включён ema_proximity_pct — цена не дальше N% от EMA50.
+        Если фильтр выключен в настройках, всегда разрешает вход."""
+        if not self.trend_enabled:
+            return True
+        e = self.get_ema_trend(symbol)
         if e is None:
             self.log(f"{symbol}: мало свечей для EMA{EMA_PERIOD} — сигнал пропущен")
             return False
-        cur = closes[-1]
-        if side == "LONG":
-            return cur > e
-        return cur < e
+        try:
+            cur = self.api.price(symbol)
+        except Exception as ex:
+            self.log(f"{symbol}: цена не получена ({ex}) — сигнал пропущен")
+            return False
+        # тренд: вход только по направлению тренда относительно EMA
+        if side == "LONG" and cur <= e:
+            return False
+        if side == "SHORT" and cur >= e:
+            return False
+        # «Не догоняем»: цена должна быть в пределах N% от EMA
+        if self.ema_proximity_pct > 0:
+            dist_pct = abs(cur - e) / e * 100.0
+            if dist_pct > self.ema_proximity_pct:
+                return False
+        return True
 
     def sfp_signal(self, symbol):
         c = self.api.candles(symbol, limit=30)
@@ -781,6 +812,11 @@ class Bot:
     def run(self):
         if self.trend_enabled:
             trend_info = f"тренд: EMA{EMA_PERIOD} на {self.trend_label}"
+            if self.ema_proximity_pct > 0:
+                trend_info += (f", вход только в пределах "
+                               f"{self.ema_proximity_pct}% от EMA")
+            else:
+                trend_info += ", фильтр «у EMA» выключен"
         else:
             trend_info = "EMA-фильтр выключен"
         self.log(f"Бот запущен ({self.api.base}). ТФ: {self.tf_label} "
@@ -947,11 +983,11 @@ class Bot:
             self.stat_signals += 1
             scanned_any_signal = True
 
-            # EMA-фильтр тренда: сигналы против тренда отбрасываются
+            # фильтр тренда + «Не догоняем»: сигналы вдали от EMA отбрасываются
             if not self.trend_ok(symbol, side):
                 self.stat_skipped += 1
                 if self.trend_enabled:
-                    self.log(f"{symbol}: SFP {side} против тренда "
+                    self.log(f"{symbol}: SFP {side} против тренда или вдали от EMA "
                              f"(EMA{EMA_PERIOD} на {self.trend_label}) — пропущено")
                 continue
 
@@ -1006,7 +1042,6 @@ class Bot:
             break
 
         if scanned_any_signal:
-            # сводка пишется не чаще раза в час при наличии сигналов за день
             self.log_stats_if_due()
 
 
@@ -1061,7 +1096,7 @@ def main(page: ft.Page):
     trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
                            options=[ft.dropdown.Option(EMA_OFF)] +
                                    [ft.dropdown.Option(k) for k in TIMEFRAMES],
-                           value="4 часа")
+                           value="1 день")
     api_key = ft.TextField(label="API-ключ", password=True, can_reveal_password=True)
     secret = ft.TextField(label="Секрет", password=True, can_reveal_password=True)
     symbols = ft.TextField(
@@ -1075,6 +1110,7 @@ def main(page: ft.Page):
     deposit = ft.TextField(label="Доля депозита на сделку (0.05 = 5%)", value="0.05")
     losses = ft.TextField(label="Макс. стопов в день", value="3")
     maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
+    ema_prox = ft.TextField(label="Вход только у EMA (%, 0 = выкл)", value="1.5")
     tg_token = ft.TextField(label="Токен Telegram-бота", password=True, can_reveal_password=True)
     tg_chat = ft.TextField(label="Ваш chat_id в Telegram")
 
@@ -1108,6 +1144,7 @@ def main(page: ft.Page):
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
               "api_key": api_key, "secret": secret, "symbols": symbols,
               "deposit": deposit, "losses": losses, "maxpos": maxpos,
+              "ema_prox": ema_prox,
               "tg_token": tg_token, "tg_chat": tg_chat}
 
     def collect():
@@ -1131,7 +1168,6 @@ def main(page: ft.Page):
             return
         profiles[name] = collect()
         save_profiles(profiles)
-        # последний использованный профиль — тоже в файл
         d = state_load()
         d["last_profile"] = name
         state_save(d)
@@ -1185,8 +1221,22 @@ def main(page: ft.Page):
         if not tf_cfg:
             add_log("Выберите таймфрейм из списка")
             return
-        if trend_tf.value != EMA_OFF and trend_tf.value not in TIMEFRAMES:
-            add_log("Выберите тренд-ТФ из списка")
+        # тренд-ТФ должен быть строго крупнее рабочего ТФ
+        if trend_tf.value != EMA_OFF:
+            if trend_tf.value not in TIMEFRAMES:
+                add_log("Выберите тренд-ТФ из списка")
+                return
+            if TF_ORDER.index(trend_tf.value) <= TF_ORDER.index(tf.value):
+                add_log(f"Тренд-ТФ должен быть крупнее рабочего ТФ "
+                        f"(рабочий: {tf.value})")
+                return
+        try:
+            prox = float(ema_prox.value)
+        except ValueError:
+            add_log("Проверьте число в поле «Вход только у EMA»")
+            return
+        if prox > 0 and trend_tf.value == EMA_OFF:
+            add_log("Для фильтра «у EMA» нужен тренд-ТФ — выберите его вместо «Выключен»")
             return
         demo = mode.value == "Демо"
         if ex.value == "Bybit":
@@ -1199,6 +1249,7 @@ def main(page: ft.Page):
             bot = Bot(api, tf.value, trend_tf.value, pairs,
                       float(deposit.value),
                       int(losses.value), int(maxpos.value), add_log,
+                      ema_proximity_pct=prox,
                       load_state=load_state, save_state=save_state)
         except ValueError:
             add_log("Проверьте числа в настройках")
@@ -1239,6 +1290,7 @@ def main(page: ft.Page):
             ft.Container(losses, expand=1),
         ]),
         ft.Container(maxpos, expand=1),
+        ema_prox,
         tg_token, tg_chat,
         moscow_note,
         ft.Row([btn_start, btn_stop]),
