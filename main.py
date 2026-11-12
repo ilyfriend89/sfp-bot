@@ -582,7 +582,8 @@ class Bot:
         # статистика исходов сделок за день
         self.stat_out = {"СТОП": 0, "БЕЗУБЫТОК": 0,
                          "ТЕЙК-ПОЛНЫЙ": 0, "ПРОЧЕЕ": 0}
-        self.stat_r = 0.0  # суммарный результат за день в R
+        self.stat_r = 0.0       # суммарный результат за день в R
+        self.stat_r_usdt = 0.0  # суммарный результат за день в USDT
 
     def load_losses(self):
         if not self._load_state:
@@ -619,11 +620,13 @@ class Bot:
                  f"входов — {self.stat_entries}. "
                  f"Сделки: СТОП — {o['СТОП']}, БЕЗУБЫТОК — {o['БЕЗУБЫТОК']}, "
                  f"полный тейк — {o['ТЕЙК-ПОЛНЫЙ']}, прочее — {o['ПРОЧЕЕ']}. "
-                 f"Суммарно за день: {self.stat_r:+.2f}R")
+                 f"Суммарно за день: {self.stat_r:+.2f}R "
+                 f"({self.stat_r_usdt:+.2f} USDT)")
 
     def close_stats(self, symbol, p, category, cur=None):
-        """Учитывает закрытую сделку в дневной статистике: категория и R.
-        R = вклад исполненных тейков + результат закрытия остатка."""
+        """Учитывает закрытую сделку в дневной статистике: категория, R и USDT.
+        R = вклад исполненных тейков + результат закрытия остатка.
+        R в деньгах = расстояние до стопа * полный объём позиции (на момент входа)."""
         filled = sum(p["tp_filled"])
         r_total = sum(TP_R_CONTRIB[i] for i in range(filled))
         remaining = (3 - filled) / 3.0
@@ -636,11 +639,18 @@ class Bot:
         else:
             r_close = -1.0 if category == "СТОП" else 0.0
         r_total += remaining * r_close
+
+        # R в деньгах: сколько USDT стоил бы 1R по этой сделке
+        r_usdt = abs(p["entry"] - p["stop_price"]) * (p.get("qty_total") or 0.0)
+        usdt_total = r_total * r_usdt
+
         self.stat_out[category] = self.stat_out.get(category, 0) + 1
         self.stat_r += r_total
+        self.stat_r_usdt += usdt_total
         self.log(f"Итог сделки {symbol}: {category}, "
-                 f"результат {r_total:+.2f}R "
-                 f"(тейков исполнено: {filled}/3, за день {self.stat_r:+.2f}R)")
+                 f"результат {r_total:+.2f}R ({usdt_total:+.2f} USDT) "
+                 f"(тейков исполнено: {filled}/3), "
+                 f"за день {self.stat_r:+.2f}R ({self.stat_r_usdt:+.2f} USDT)")
 
     def reset_daily_stats(self):
         """Сброс дневных счётчиков: лимит стопов, сигналы, исходы сделок."""
@@ -653,6 +663,7 @@ class Bot:
         self.stat_out = {"СТОП": 0, "БЕЗУБЫТОК": 0,
                          "ТЕЙК-ПОЛНЫЙ": 0, "ПРОЧЕЕ": 0}
         self.stat_r = 0.0
+        self.stat_r_usdt = 0.0
         self.persist_losses()
 
     def cleanup_orders(self, symbol):
