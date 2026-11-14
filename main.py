@@ -529,7 +529,7 @@ class BingXAPI:
                      {"symbol": self.fmt(symbol)})
         return float(d[0]["lastPrice"])
 
-        def balance(self):
+    def balance(self):
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
         if isinstance(d, dict):
             for key in ("balance", "usableMargin", "accountMargin"):
