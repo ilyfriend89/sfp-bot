@@ -509,9 +509,13 @@ class BingXAPI:
                       "interval": interval or self.interval,
                       "limit": limit})
         if isinstance(d, dict):
+            d = d.get("data", d)              # разворот оболочки data
+        if isinstance(d, dict):
             d = d.get("o") or d.get("list") or []
+        if not isinstance(d, (list, tuple)):
+            d = []
         rows = []
-        for k in d or []:
+        for k in d:
             if isinstance(k, (list, tuple)):
                 rows.append((float(k[1]), float(k[2]), float(k[3]),
                              float(k[4]), float(k[5])))
@@ -523,22 +527,33 @@ class BingXAPI:
                              float(k.get("volume", k.get("v", 0)))))
         rows.sort(key=lambda x: x[0])
         return rows
-
     def price(self, symbol):
         d = self.req("GET", "/openApi/swap/v2/quote/ticker",
                      {"symbol": self.fmt(symbol)})
-        return float(d[0]["lastPrice"])
+        if isinstance(d, dict):
+            d = d.get("data", d)          # снимаем оболочку data
+        if isinstance(d, list) and d:     # биржа отдаёт список объектов
+            d = d[0]
+        if isinstance(d, dict):
+            for key in ("lastPrice", "price", "c", "close"):
+                v = d.get(key)
+                if isinstance(v, (str, int, float)) and str(v) != "":
+                    return float(v)
+        return None
 
     def balance(self):
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
         if isinstance(d, dict):
-            for key in ("balance", "usableMargin", "accountMargin"):
-                if d.get(key) not in (None, ""):
-                    return float(d[key])
-        elif isinstance(d, list):
+            d = d.get("data", d)          # снимаем оболочку data
+        if isinstance(d, list):           # вариант: список монет
             for coin in d:
-                if coin.get("coin") == "USDT":
+                if str(coin.get("coin")) == "USDT":
                     return float(coin.get("balance") or 0)
+        if isinstance(d, dict):           # вариант: словарь с полями
+            for key in ("balance", "usableMargin", "accountMargin"):
+                v = d.get(key)
+                if isinstance(v, (str, int, float)) and str(v) != "":
+                    return float(v)
         return 0.0
 
     def open_positions(self):
