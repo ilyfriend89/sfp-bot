@@ -1016,10 +1016,6 @@ class Bot:
                  f"[{len(self.positions)}/{self.max_positions}]")
 
     def scan_signals(self):
-        """v4: обе стратегии активны на каждом скане (детектор-шлюз убран).
-        Конфликт решает pick_signal: совпадение -> ДИАПАЗОН,
-        разнонаправленные -> пропуск. Висящий лимит-ордер не перебивается:
-        позиция/pend уже есть — пара пропускается (FIFO)."""
         if self.losses_today >= self.max_losses:
             return
         if len(self.positions) >= self.max_positions:
@@ -1033,9 +1029,12 @@ class Bot:
                 break
             if self.losses_by_pair.get(symbol, 0) >= MAX_STOPS_PER_PAIR:
                 continue
+            time.sleep(0.25)   # пауза против rate limit (请稍后重试)
             try:
                 ssig = self.sfp_signal(symbol)
-                if ssig[0]:
+                if not ssig[0]:
+                    ssig = None            # пустой кортеж -> честный None
+                else:
                     self.stat_signals += 1
                     if not self.trend_ok(symbol, ssig[0], ssig[1]):
                         self.stat_skipped += 1
@@ -1043,10 +1042,12 @@ class Bot:
                             self.log(f"{symbol}: SFP {ssig[0]} против тренда или "
                                      f"вдали от EMA (EMA{EMA_PERIOD} на "
                                      f"{self.trend_label}) — пропущено")
-                        ssig = (None, None, None)
+                        ssig = None
                 rsig = self.range_signal(symbol)
+                if not rsig[0]:
+                    rsig = None            # та же нормализация
                 kind, sig = pick_signal(rsig, ssig)
-                if kind is None:
+                if kind is None or not sig[0]:
                     continue
                 side, entry, stop = sig
                 if kind == "range":
