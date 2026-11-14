@@ -19,12 +19,19 @@ jobs:
           channel: stable
       - name: Flutter doctor (диагностика)
         run: flutter doctor -v
-      - name: Принять лицензии Android
+      - name: Принять лицензии Android (системный SDK)
         run: yes | flutter doctor --android-licenses || true
-      - name: Flutter doctor после лицензий
-        run: flutter doctor -v
       - run: pip install flet
-      - run: yes | flet build apk --verbose
+      - name: Первая сборка (готовит SDK flet, может упасть на лицензиях)
+        run: yes | flet build apk --verbose
+        continue-on-error: true
+      - name: Принять лицензии для SDK flet
+        run: |
+          SM=$(find $HOME /opt/hostedtoolcache -type f -name sdkmanager 2>/dev/null | head -1)
+          echo "sdkmanager: $SM"
+          [ -n "$SM" ] && yes | "$SM" --licenses || true
+      - name: Повторная сборка
+        run: yes | flet build apk --verbose
       - uses: actions/upload-artifact@v4
         with:
           name: bot-apk
