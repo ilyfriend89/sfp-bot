@@ -7,6 +7,8 @@
 #  баре: совпадение направления -> приоритет ДИАПАЗОНА; разнонаправленные
 #  -> пропуск (канал сломан). Висящий лимит-ордер новым сигналом не
 #  перебивается (FIFO). Килл-зоны отключены — торговля 24/7.
+#  Сигналы считаются только по ЗАКРЫТЫМ барам (в списке API это c[-2],
+#  последняя свеча c[-1] ещё формируется).
 # ======================================================================
 
 import time, hmac, hashlib, urllib.parse, threading, json, os
@@ -41,9 +43,11 @@ TIMEFRAMES = {
     "1 день":   {"interval_bybit": "D",   "interval_bingx": "1d",  "vol_mult": 1.2},
 }
 
+# длительность свечи в минутах — для расчёта ожидания лимит-входа
 TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 минут": 30,
               "1 час": 60, "4 часа": 240, "1 день": 1440}
 
+# порядок ТФ по возрастанию — для проверки «тренд крупнее рабочего»
 TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут",
             "1 час", "4 часа", "1 день"]
 
@@ -67,7 +71,7 @@ BINGX_ALIASES = {
     "WIFUSDT":   "WIFUSDT",
 }
 
-EMA_PERIOD = 50      # период EMA для фильтра тренда (EMA50 на тренд-ТФ)
+EMA_PERIOD = 50      # период EMA фильтра тренда (EMA50 на тренд-ТФ)
 EMA_OFF = "Выключен"
 TREND_CACHE_TTL = 60
 
@@ -94,7 +98,7 @@ TREND_TRAIL_EMA = 20
 RANGE_DAYS = 3
 RANGE_TOUCH_TOL = 0.0015    # допуск касания границы канала, 0.15%
 RANGE_VOL_MULT = 1.3
-RANGE_STOP_ADD = 0.008      # стоп на 0.8% за границей канала
+RANGE_STOP_ADD = 0.008      # стоп на 0.8% за границей канала (hi*1.008 / lo*0.992)
 TP_RANGE = [(0.5, 0.5), (1.0, 0.5)]
 
 # SFP-тренд: свинг-окно 20 баров (валидация v3.1)
@@ -103,7 +107,7 @@ SFP_SWING = 20
 RISK_CAP_LEVERAGE = 10.0   # лимит расчёта бота (в приложении биржи — 5x Isolated)
 MIN_STOP_PCT = 0.8         # стоп ближе 0.8% — сигнал пропускаем («пыль»)
 MAX_STOPS_PER_PAIR = 3     # стопов на одну пару в день
-MAX_STOPS_BASKET = 5       # стопов на всю корзину в день (v4)
+MAX_STOPS_BASKET = 5       # стопов на всю корзину в день (v4; дефолт и в поле UI)
 ENTRY_WAIT = 3             # свечей на исполнение лимит-входа (иначе отмена)
 
 
@@ -162,7 +166,7 @@ def ema(values, period):
 
 
 def ema_series(values, n):
-    """Серия EMA (как в эталоне walk): старт с первого значения."""
+    """Серия EMA (как в эталоне: старт с первого значения)."""
     if len(values) < n:
         return []
     k = 2.0 / (n + 1)
@@ -176,8 +180,9 @@ def ema_series(values, n):
 def pick_signal(rsig, ssig):
     """v4: обе стратегии активны на каждом баре, детектор-шлюз убран.
     Конфликт: оба сигнала в одну сторону -> приоритет ДИАПАЗОНА;
-    разные направления -> пропуск (канал сломан). Висящий pend-ордер
-    новым сигналом не перебивается (FIFO — проверка до генерации)."""
+    разные направления -> пропуск (канал сломан). Висящий лимит-ордер
+    новым сигналом не перебивается (FIFO — позиции/pend проверяются до
+    генерации сигналов). rsig/ssig — кортеж (side, entry, stop) или None."""
     if rsig is not None and ssig is not None:
         if rsig[0] == ssig[0]:
             return "range", rsig
@@ -554,7 +559,7 @@ class BingXAPI:
                 if o.get("reduceOnly") in (True, "true", 1):
                     if o.get("type") == "TRIGGER_MARKET" and o.get("stopPrice"):
                         stop = float(o["stopPrice"])
-                    elif o.get("type") == "LIMIT" and o.get("price")
+                    elif o.get("type") == "LIMIT" and o.get("price"):
                         tp = float(o["price"])
         except Exception:
             pass
@@ -600,8 +605,6 @@ class BingXAPI:
         if reduce_only:
             p["reduceOnly"] = True
         return self.req("POST", "/openApi/swap/v2/trade/order", p)
-
-
 class Bot:
     def __init__(self, api, tf_label, trend_label, symbols, risk_pct,
                  max_losses_per_day, max_positions, log,
@@ -636,7 +639,7 @@ class Bot:
         self.losses_today = 0
         self.losses_by_pair = {}
         self.positions = {}
-        self.dry_balance = DRY_RUN_BALANCE   # компаунд в DRY-RUN
+        self.dry_balance = DRY_RUN_BALANCE   # компаунд расчётного баланса
         self.stat_signals = 0
         self.stat_skipped = 0
         self.stat_entries = 0
@@ -691,7 +694,7 @@ class Bot:
 
     def close_stats(self, symbol, p, category, cur=None):
         """Закрытая сделка в дневной статистике. Схемы v4:
-        тренд — вклады тейков 1.0*0.5 + 1.6*0.25 = 0.90R, хвост 0.25;
+        тренд — тейки 1.0*0.5 + 1.6*0.25 = 0.90R, хвост 0.25;
         диапазон — 0.5*0.5 + 1.0*0.5 = 0.75R, хвоста нет."""
         if p.get("scheme") == "RANGE":
             contrib = [r * w for (r, w) in TP_RANGE]
@@ -783,20 +786,17 @@ class Bot:
                      f"мог остаться, проверьте вручную")
 
     def place_tps(self, symbol, p):
-        """Лимитные тейки по долям схемы: тренд 1/2 + 1/4 (хвост 1/4
-        трейлится за EMA20 без тейк-ордера), диапазон 1/2 + 1/2."""
+        """Лимитные тейки строго по долям схемы (v4):
+        тренд 1/2 + 1/4 — хвост 1/4 НЕ закрывается тейком, он трейлится
+        за EMA20; диапазон 1/2 + 1/2."""
         if DRY_RUN:
             return 0
         side = p["side"]
         qty = p["qty_total"]
         splits = p["splits"]
         placed = 0
-        q_left = qty
         for i, (w, tp) in enumerate(zip(splits, p["tp_levels"])):
-            if i < len(splits) - 1:
-                q = self.api.qty_ok(symbol, qty * w, price=p["entry"])
-            else:
-                q = self.api.qty_ok(symbol, q_left, price=p["entry"])
+            q = self.api.qty_ok(symbol, qty * w, price=p["entry"])
             if q <= 0:
                 self.log(f"{symbol}: тейк {i + 1} ниже минимума биржи — пропущен")
                 continue
@@ -806,14 +806,12 @@ class Bot:
                 placed += 1
             except Exception as ex:
                 self.log(f"{symbol}: тейк {i + 1} не выставлен — {ex}")
-            q_left -= q
         if placed == 0:
             self.log(f"{symbol}: тейки не выставлены — сопровождение по стопу")
         return placed
 
     def get_ema20(self, symbol):
-        """EMA20 рабочего ТФ для трейлинга хвоста тренда. Последнее значение
-        или None при нехватке свечей."""
+        """EMA20 рабочего ТФ (по закрытым свечам) для трейлинга хвоста."""
         try:
             c = self.api.candles(symbol, limit=TREND_TRAIL_EMA * 3)
         except Exception:
@@ -822,52 +820,25 @@ class Bot:
         s = ema_series(closes, TREND_TRAIL_EMA)
         return s[-1] if s else None
 
-    def recover(self):
-        if DRY_RUN:
-            self.load_losses()
-            return
+    def get_ema_trend(self, symbol):
+        now = time.time()
+        cached = self.trend_cache.get(symbol)
+        if cached and now - cached[0] < TREND_CACHE_TTL:
+            return cached[1]
         try:
-            open_pos = self.api.open_positions()
+            c = self.api.candles(symbol, limit=EMA_PERIOD * 2,
+                                 interval=self.trend_interval)
         except Exception as ex:
-            self.log(f"Не удалось получить открытые позиции: {ex}")
-            return
-        for sym, info in open_pos.items():
-            if sym not in self.symbols:
-                continue
-            side, entry, qty = info["side"], info["entry"], info["qty"]
-            stop, _ = self.api.pending_exit_prices(sym)
-            for oid in self.api.open_reduce_orders(sym):
-                self.api.cancel(sym, oid)
-            if not stop or stop == entry:
-                stop = entry - entry * 0.01 if side == "LONG" else entry + entry * 0.01
-                self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
-            stop = self.api.price_ok(sym, stop)
-            offsets = [r for (r, _) in TP_TREND]
-            tps = [self.api.price_ok(sym, t) for t in
-                   calc_tps(entry, stop, side, offsets)]
-            self.positions[sym] = {
-                "phase": "ACTIVE",
-                "scheme": "SFP", "splits": [w for (_, w) in TP_TREND],
-                "side": side, "entry": entry, "stop_price": stop,
-                "risk": abs(entry - stop),
-                "stop_id": None, "tp_levels": tps,
-                "tp_filled": [False] * len(TP_TREND),
-                "tail": False,
-                "qty_total": qty, "qty": qty,
-            }
-            self.positions[sym]["stop_id"] = self.place_stop(
-                sym, self.positions[sym], qty, stop)
-            self.place_tps(sym, self.positions[sym])
-            self.log(f"Восстановлена позиция {side} {sym} по {qstr(entry)}, "
-                     f"объём {qstr(qty)}: стоп {qstr(stop)}, "
-                     f"тейки {' / '.join(qstr(t) for t in tps)} "
-                     f"(хвост 25% — трейлинг EMA{TREND_TRAIL_EMA})")
-        if open_pos:
-            self.log(f"Итого восстановлено позиций: {len(open_pos)}")
-        self.load_losses()
+            self.log(f"{symbol}: EMA не получена ({ex}) — сигнал пропущен")
+            return None
+        closes = [x[3] for x in c]
+        e = ema(closes, EMA_PERIOD)
+        if e is not None:
+            self.trend_cache[symbol] = (now, e)
+        return e
 
     def trend_ok(self, symbol, side, entry):
-        """EMA50 тренд-ТФ + NO_CHASE (как в эталоне v4):
+        """EMA50 тренд-ТФ + NO_CHASE (как в бэктесте sfp_ema_ok):
         LONG — цена выше EMA и не дальше N% в сторону сигнала,
         SHORT — ниже EMA и не дальше N%."""
         if not self.trend_enabled:
@@ -891,37 +862,20 @@ class Bot:
                 return False
         return True
 
-    def get_ema_trend(self, symbol):
-        now = time.time()
-        cached = self.trend_cache.get(symbol)
-        if cached and now - cached[0] < TREND_CACHE_TTL:
-            return cached[1]
-        try:
-            c = self.api.candles(symbol, limit=EMA_PERIOD * 2,
-                                 interval=self.trend_interval)
-        except Exception as ex:
-            self.log(f"{symbol}: EMA не получена ({ex}) — сигнал пропущен")
-            return None
-        closes = [x[3] for x in c]
-        e = ema(closes, EMA_PERIOD)
-        if e is not None:
-            self.trend_cache[symbol] = (now, e)
-        return e
-
     def sfp_signal(self, symbol):
-        """SFP-тренд (v4): свайп экстремума за SFP_SWING закрытых баров с
-        возвратом, объём x vol_mult среднего. Вход — уровень свинга,
-        стоп — за свайпнутым экстремумом (max(h, swing)*1.001 / min(l, ...)*0.999).
-        Килл-зоны отключены — круглосуточно."""
+        """SFP-тренд (v4 = build_sfp бэктеста): свайп экстремума за окно
+        из SFP_SWING ЗАКРЫТЫХ баров перед сигнальным, сигнальный бар —
+        последний ЗАКРЫТЫЙ (c[-2]), объём строго больше xvol_mult среднего.
+        Вход — уровень свинга, стоп за свайпнутым экстремумом."""
         c = self.api.candles(symbol, limit=SFP_SWING + 2)
-        if len(c) < SFP_SWING + 1:
+        if len(c) < SFP_SWING + 2:
             return None, None, None
-        window = c[-(SFP_SWING + 1):-1]
-        sw_lo = min(x[2] for x in window)
+        window = c[-(SFP_SWING + 2):-2]   # 20 закрытых баров перед сигнальным
         sw_hi = max(x[1] for x in window)
+        sw_lo = min(x[2] for x in window)
         avg_vol = sum(x[4] for x in window) / len(window)
-        last = c[-1]
-        if last[4] < self.vol_mult * avg_vol:
+        last = c[-2]                      # последний ЗАКРЫТЫЙ бар
+        if last[4] <= self.vol_mult * avg_vol:
             return None, None, None
         if last[1] > sw_hi and last[3] < sw_hi:
             return "SHORT", sw_hi, max(last[1], sw_hi) * 1.001
@@ -930,22 +884,24 @@ class Bot:
         return None, None, None
 
     def range_signal(self, symbol):
-        """Диапазонный модуль (v4): канал RANGE_DAYS дней, >=2 касаний,
-        реверс от границы с закрытием внутрь, объём x1.3 среднего.
-        Вход — граница канала (лимит), стоп за границей (+0.8%)."""
+        """Диапазонный модуль (v4 = build_range бэктеста): канал из
+        range_bars ЗАКРЫТЫХ баров, >=2 касаний границы с допуском,
+        реверс от границы с закрытием ВНУТРЬ канала (сравнение close с
+        границей, скорректированной на допуск), объём x1.3 среднего.
+        Вход — граница, стоп за границей (+0.8%)."""
         need = self.range_bars + 2
         c = self.api.candles(symbol, limit=need)
-        if len(c) < need:
+        if len(c) < self.range_bars + 2:
             return None, None, None
-        hist = c[-(self.range_bars + 1):-1]
+        hist = c[-(self.range_bars + 2):-2]   # закрытые бары канала
         upper = max(x[1] for x in hist)
         lower = min(x[2] for x in hist)
         avg_vol = sum(x[4] for x in hist) / len(hist)
         tol = RANGE_TOUCH_TOL
         touch_up = sum(1 for x in hist if x[1] >= upper * (1 - tol))
         touch_dn = sum(1 for x in hist if x[2] <= lower * (1 + tol))
-        last = c[-1]
-        if last[4] < RANGE_VOL_MULT * avg_vol:
+        last = c[-2]                          # последний ЗАКРЫТЫЙ бар
+        if last[4] <= RANGE_VOL_MULT * avg_vol:
             return None, None, None
         if (touch_up >= 2 and last[1] >= upper * (1 - tol) and
                 last[3] < upper * (1 - tol)):
@@ -956,8 +912,9 @@ class Bot:
         return None, None, None
 
     def try_enter(self, symbol, side, entry, stop, scheme):
-        """Вход лимитом по УРОВНЮ СИГНАЛА (как в эталоне: fill только при
-        касании границы/свинга). Риск — компаунд 1.5% от текущего баланса."""
+        """Вход лимитом по УРОВНЮ СИГНАЛА (как в бэктесте: исполнение
+        только при касании границы/свинга). Риск — компаунд 1.5% от
+        ТЕКУЩЕГО баланса."""
         entry = self.api.price_ok(symbol, entry)
         stop = self.api.price_ok(symbol, stop)
         risk = abs(entry - stop)
@@ -1006,17 +963,18 @@ class Bot:
         tag = "DRY-RUN " if DRY_RUN else ""
         tp_txt = " / ".join(qstr(t) for t in tps)
         split_txt = ", ".join(_fmt_frac(w) for w in splits)
+        tail_txt = (f" + хвост 1/4 трейлинг EMA{TREND_TRAIL_EMA}"
+                    if scheme == "SFP" else "")
         self.log(f"{tag}ЛИМИТ-ВХОД {side} {symbol} [{scheme}] по {qstr(entry)}, "
                  f"стоп {qstr(stop)} ({stop_frac * 100:.2f}%), "
-                 f"тейки: {tp_txt} ({split_txt})"
-                 + (f" + хвост 1/4 трейлинг EMA{TREND_TRAIL_EMA}"
-                    if scheme == "SFP" else "")
-                 f" [{len(self.positions)}/{self.max_positions}]")
+                 f"тейки: {tp_txt} ({split_txt}){tail_txt} "
+                 f"[{len(self.positions)}/{self.max_positions}]")
 
     def scan_signals(self):
-        """v4: обе стратегии активны на каждом баре. Конфликт решает
-        pick_signal: совпадение -> диапазон, разнонаправленные -> пропуск.
-        Висящий лимит-ордер не перебивается (позиция/pend уже есть — пропуск)."""
+        """v4: обе стратегии активны на каждом скане (детектор-шлюз убран).
+        Конфликт решает pick_signal: совпадение -> ДИАПАЗОН,
+        разнонаправленные -> пропуск. Висящий лимит-ордер не перебивается:
+        позиция/pend уже есть — пара пропускается (FIFO)."""
         if self.losses_today >= self.max_losses:
             return
         if len(self.positions) >= self.max_positions:
@@ -1068,12 +1026,12 @@ class Bot:
         mode_info = "DRY-RUN (ордера НЕ отправляются)" if DRY_RUN else "РЕАЛЬНЫЙ РЕЖИМ"
         self.log(WARNING_ISOLATED)
         self.log(f"Бот запущен ({self.api.base}). {mode_info}. ТФ: {self.tf_label}")
-        self.log(f"v4: килл-зоны отключены, торговля 24/7. "
-                 f"Конфликт сигналов: совпадение -> ДИАПАЗОН, разнонаправленные -> пропуск")
+        self.log(f"v4: килл-зоны отключены, торговля 24/7. Конфликт сигналов: "
+                 f"совпадение -> ДИАПАЗОН, разнонаправленные -> пропуск")
         self.log(f"Диапазон: канал {RANGE_DAYS} дн. ({self.range_bars} бар), "
                  f"касания >=2, объём x{RANGE_VOL_MULT}, вход лимитом по границе, "
-                 f"стоп за границей, тейки 0.5R/1.0R долями 1/2, 1/2, "
-                 f"BE сразу после ТП1")
+                 f"стоп за границей (+{RANGE_STOP_ADD * 100:.1f}%), "
+                 f"тейки 0.5R/1.0R долями 1/2, 1/2, BE сразу после ТП1")
         self.log(f"SFP-тренд: свинг {SFP_SWING} бар, объём x{self.vol_mult}, "
                  f"{trend_info}. Тейки 1.0R (1/2) и 1.6R (1/4), BE после ТП1, "
                  f"хвост 25% трейлингом EMA{TREND_TRAIL_EMA}")
@@ -1115,6 +1073,50 @@ class Bot:
                     break
                 time.sleep(1)
         self.log("Бот остановлен")
+
+    def recover(self):
+        if DRY_RUN:
+            self.load_losses()
+            return
+        try:
+            open_pos = self.api.open_positions()
+        except Exception as ex:
+            self.log(f"Не удалось получить открытые позиции: {ex}")
+            return
+        for sym, info in open_pos.items():
+            if sym not in self.symbols:
+                continue
+            side, entry, qty = info["side"], info["entry"], info["qty"]
+            stop, _ = self.api.pending_exit_prices(sym)
+            for oid in self.api.open_reduce_orders(sym):
+                self.api.cancel(sym, oid)
+            if not stop or stop == entry:
+                stop = entry - entry * 0.01 if side == "LONG" else entry + entry * 0.01
+                self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
+            stop = self.api.price_ok(sym, stop)
+            offsets = [r for (r, _) in TP_TREND]
+            tps = [self.api.price_ok(sym, t) for t in
+                   calc_tps(entry, stop, side, offsets)]
+            self.positions[sym] = {
+                "phase": "ACTIVE",
+                "scheme": "SFP", "splits": [w for (_, w) in TP_TREND],
+                "side": side, "entry": entry, "stop_price": stop,
+                "risk": abs(entry - stop),
+                "stop_id": None, "tp_levels": tps,
+                "tp_filled": [False] * len(TP_TREND),
+                "tail": False,
+                "qty_total": qty, "qty": qty,
+            }
+            self.positions[sym]["stop_id"] = self.place_stop(
+                sym, self.positions[sym], qty, stop)
+            self.place_tps(sym, self.positions[sym])
+            self.log(f"Восстановлена позиция {side} {sym} по {qstr(entry)}, "
+                     f"объём {qstr(qty)}: стоп {qstr(stop)}, "
+                     f"тейки {' / '.join(qstr(t) for t in tps)} "
+                     f"(хвост 25% — трейлинг EMA{TREND_TRAIL_EMA})")
+        if open_pos:
+            self.log(f"Итого восстановлено позиций: {len(open_pos)}")
+        self.load_losses()
 
     def manage_positions(self):
         if self.day != dt.date.today():
@@ -1216,8 +1218,8 @@ class Bot:
                         self.move_stop(symbol, p, p["entry"], info["qty"])
                 if filled_now >= n_tps:
                     if p["scheme"] == "SFP":
-                        # все тейки тренда отработали — остаётся хвост 25%,
-                        # стоп трейлится за EMA20 рабочего ТФ
+                        # тейки тренда отработали — остаётся хвост 25%,
+                        # стоп трейлится за EMA20 (v4)
                         p["tail"] = True
                         self.log(f"{symbol}: тейки тренда отработаны, "
                                  f"хвост 25% трейлится за EMA{TREND_TRAIL_EMA}")
@@ -1274,8 +1276,10 @@ class Bot:
                         self.log(f"{symbol}: не удалось закрыть — {ex}")
 
     def _manage_dry(self):
-        """DRY-RUN: локальное сопровождение по текущей цене. Стоп проверяется
-        первым; после всех тейков тренда хвост трейлится за EMA20."""
+        """DRY-RUN: локальное сопровождение по текущей цене (как walk
+        бэктеста): стоп проверяется первым на каждом баре-цикле, тейки —
+        после, с уменьшением объёма; после всех тейков тренда хвост
+        трейлится за EMA20."""
         for symbol in list(self.positions):
             p = self.positions[symbol]
             splits = p["splits"]
@@ -1304,7 +1308,7 @@ class Bot:
                     del self.positions[symbol]
                 continue
 
-            # трейлинг хвоста тренда за EMA20 (обновление стопа до проверки)
+            # трейлинг хвоста тренда за EMA20 — обновление стопа ДО проверки
             if p.get("tail"):
                 e = self.get_ema20(symbol)
                 if e is not None:
@@ -1317,7 +1321,7 @@ class Bot:
                                  f"EMA{TREND_TRAIL_EMA} {qstr(new_stop)}")
                         p["stop_price"] = new_stop
 
-            # 1) стоп
+            # 1) стоп (как в walk: стоп первым в баре)
             if ((p["side"] == "LONG" and cur <= p["stop_price"]) or
                     (p["side"] == "SHORT" and cur >= p["stop_price"])):
                 loss_close = ((p["side"] == "LONG" and p["stop_price"] < p["entry"]) or
@@ -1339,7 +1343,7 @@ class Bot:
                 del self.positions[symbol]
                 continue
 
-            # 2) тейки
+            # 2) тейки — с уменьшением оставшегося объёма (v4)
             for i in range(n_tps):
                 if p["tp_filled"][i]:
                     continue
@@ -1348,14 +1352,17 @@ class Bot:
                 if not hit:
                     break
                 p["tp_filled"][i] = True
+                p["qty"] = max(0.0, p["qty"] - p["qty_total"] * splits[i])
                 self.log(f"DRY-RUN: ТЕЙК {i + 1}/{n_tps} по {symbol} достигнут "
-                         f"({qstr(p['tp_levels'][i])})")
+                         f"({qstr(p['tp_levels'][i])}), объём остатка "
+                         f"{qstr(p['qty'])}")
                 if i == 0:
                     p["stop_price"] = p["entry"]
                     self.log(f"{symbol}: стоп перенесён на безубыток "
                              f"{qstr(p['entry'])}")
             if sum(p["tp_filled"]) >= n_tps:
-                if p["scheme"] == "SFP":
+                if p["scheme"] == "SFP" and p["qty"] > 1e-9:
+                    # остаётся хвост 25% — трейлинг за EMA20 (v4)
                     p["tail"] = True
                     self.log(f"DRY-RUN: {symbol} тейки тренда отработаны, "
                              f"хвост 25% трейлится за EMA{TREND_TRAIL_EMA}")
@@ -1381,6 +1388,7 @@ def tg_send(cfg, text):
 
 def main(page: ft.Page):
     page.title = "SFP-бот v4"
+    # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
     page.padding = 48
 
     def load_profiles():
@@ -1401,6 +1409,7 @@ def main(page: ft.Page):
         d["losses"] = data
         state_save(d)
 
+    # ---- дефолты полей по эталону v4 ----
     ex = ft.Dropdown(label="Биржа",
                      options=[ft.dropdown.Option("Bybit"),
                               ft.dropdown.Option("BingX")],
@@ -1550,6 +1559,7 @@ def main(page: ft.Page):
         if not tf_cfg:
             add_log("Выберите таймфрейм из списка")
             return
+        # тренд-ТФ должен быть строго крупнее рабочего ТФ
         if trend_tf.value != EMA_OFF:
             if trend_tf.value not in TIMEFRAMES:
                 add_log("Выберите тренд-ТФ из списка")
@@ -1651,6 +1661,7 @@ def main(page: ft.Page):
         content,
     ], spacing=10, expand=True))
 
+    # восстановление последнего профиля из файла
     try:
         last = state_load().get("last_profile")
         if last and last in profiles:
