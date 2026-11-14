@@ -503,7 +503,7 @@ class BingXAPI:
             return round(price, 6)
         return round_step(price, info["tick"])
 
-        def candles(self, symbol, limit=30, interval=None):
+    def candles(self, symbol, limit=30, interval=None):
         d = self.req("GET", "/openApi/swap/v3/quote/klines",
                      {"symbol": self.fmt(symbol),
                       "interval": interval or self.interval,
