@@ -503,7 +503,7 @@ class BingXAPI:
         return round_step(price, info["tick"])
 
     def candles(self, symbol, limit=30, interval=None):
-        d = self.req("GET", "/openApi/swap/v2/quote/kline",
+        d = self.req("GET", "/openApi/swap/v2/quote/klines",
                      {"symbol": self.fmt(symbol),
                       "interval": interval or self.interval,
                       "limit": limit})
@@ -518,18 +518,15 @@ class BingXAPI:
         return float(d[0]["lastPrice"])
 
     def balance(self):
-        try:
-            d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-            if isinstance(d, dict):
-                for key in ("balance", "usableMargin", "accountMargin"):
-                    if d.get(key) not in (None, ""):
-                        return float(d[key])
-            elif isinstance(d, list):
-                for coin in d:
-                    if coin.get("coin") == "USDT":
-                        return float(coin.get("balance") or 0)
-        except Exception:
-            pass
+        d = self.req("GET", "/openApi/swap/v2/user/balance", {})
+        if isinstance(d, dict):
+            for key in ("balance", "usableMargin", "accountMargin"):
+                if d.get(key) not in (None, ""):
+                    return float(d[key])
+        elif isinstance(d, list):
+            for coin in d:
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("balance") or 0)
         return 0.0
 
     def open_positions(self):
