@@ -498,6 +498,8 @@ class BingXAPI:
         return qty
 
     def price_ok(self, symbol, price):
+        if not isinstance(price, (int, float)):
+            return None
         info = self._load_lots().get(self.sym(symbol))
         if info is None:
             self._lots = None
@@ -950,11 +952,16 @@ class Bot:
         return None, None, None
 
     def try_enter(self, symbol, side, entry, stop, scheme):
-        """Вход лимитом по УРОВНЮ СИГНАЛА (как в бэктесте: исполнение
-        только при касании границы/свинга). Риск — компаунд 1.5% от
-        ТЕКУЩЕГО баланса."""
+        if not isinstance(entry, (int, float)) or not isinstance(stop, (int, float)):
+            self.log(f"{symbol}: сигнал с некорректными ценами "
+                     f"(entry={entry!r}, stop={stop!r}) — пропущено")
+            return
         entry = self.api.price_ok(symbol, entry)
         stop = self.api.price_ok(symbol, stop)
+        if not isinstance(entry, (int, float)) or not isinstance(stop, (int, float)):
+            self.log(f"{symbol}: цена/стоп после округления нечисловые "
+                     f"(entry={entry!r}, stop={stop!r}) — сигнал пропущен")
+            return
         risk = abs(entry - stop)
         if risk <= 0:
             return
