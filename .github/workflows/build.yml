@@ -17,22 +17,16 @@ jobs:
         with:
           flutter-version: '3.47.9'
           channel: stable
-      - name: Flutter doctor (диагностика)
-        run: flutter doctor -v
-      - name: Принять лицензии Android (системный SDK)
-        run: yes | flutter doctor --android-licenses || true
-      - run: pip install flet
-      - name: Первая сборка (готовит SDK flet, может упасть на лицензиях)
-        run: yes | flet build apk --verbose
-        continue-on-error: true
-      - name: Принять лицензии для SDK flet
+      - name: GTK-библиотеки для flutter doctor
         run: |
-          SM=$(find $HOME /opt/hostedtoolcache -type f -name sdkmanager 2>/dev/null | head -1)
-          echo "sdkmanager: $SM"
-          [ -n "$SM" ] && yes | "$SM" --licenses || true
-      - name: Повторная сборка
-        run: yes | flet build apk --verbose
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev mesa-utils
+      - name: Flutter doctor (должен быть весь зелёный)
+        run: flutter doctor -v
+      - run: pip install flet
+      - run: flet build apk --verbose
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bot-apk
           path: build/apk/**/*.apk
