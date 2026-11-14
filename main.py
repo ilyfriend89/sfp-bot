@@ -437,17 +437,24 @@ class BingXAPI:
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
     def req(self, method, path, params=None):
-        qs, headers = self._query(params or {})
-        url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
-
-        r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
-            else requests.get(url, headers=headers, timeout=15)
-        if not r.text.strip():
-            raise RuntimeError("пустой ответ — проверьте ключ и права")
-        d = r.json()
-        if d.get("code") != 0:
-            raise RuntimeError(f"BingX: {d.get('msg')}")
-        return d.get("data")
+        for attempt in range(3):
+            qs, headers = self._query(params or {})
+            url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
+            r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
+                else requests.get(url, headers=headers, timeout=15)
+            if not r.text.strip():
+                raise RuntimeError("пустой ответ — проверьте ключ и права")
+            d = r.json()
+            if d.get("code") != 0:
+                msg = str(d.get("msg") or "")
+                low = msg.lower()
+                if ("稍后" in msg or "retry" in low or
+                        "rate" in low or "limit" in low):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"BingX: {d.get('msg')}")
+            return d.get("data")
+        raise RuntimeError("BingX: лимит запросов — пара пропущена")
 
     def fmt(self, symbol):
         s = self.sym(symbol)
@@ -1029,7 +1036,7 @@ class Bot:
                 break
             if self.losses_by_pair.get(symbol, 0) >= MAX_STOPS_PER_PAIR:
                 continue
-            time.sleep(0.25)   # пауза против rate limit (请稍后重试)
+            time.sleep(0.5)    # пауза против rate limit (请稍后重试)
             try:
                 ssig = self.sfp_signal(symbol)
                 if not ssig[0]:
