@@ -433,7 +433,7 @@ class BingXAPI:
                     "X-BX-SIGNATURE": sign,
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
-        def req(self, method, path, params=None):
+    def req(self, method, path, params=None):
         qs, headers = self._query(params or {})
         url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
 
