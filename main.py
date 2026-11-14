@@ -433,9 +433,10 @@ class BingXAPI:
                     "X-BX-SIGNATURE": sign,
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
-    def req(self, method, path, params=None):
+        def req(self, method, path, params=None):
         qs, headers = self._query(params or {})
-        url = f"{self.base}{path}?{qs}"
+        url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
+
         r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
             else requests.get(url, headers=headers, timeout=15)
         if not r.text.strip():
@@ -502,13 +503,24 @@ class BingXAPI:
             return round(price, 6)
         return round_step(price, info["tick"])
 
-    def candles(self, symbol, limit=30, interval=None):
-        d = self.req("GET", "/openApi/swap/v2/quote/klines",
+        def candles(self, symbol, limit=30, interval=None):
+        d = self.req("GET", "/openApi/swap/v3/quote/klines",
                      {"symbol": self.fmt(symbol),
                       "interval": interval or self.interval,
                       "limit": limit})
-        rows = [(float(k["o"]), float(k["h"]), float(k["l"]),
-                 float(k["c"]), float(k["v"])) for k in d]
+        if isinstance(d, dict):
+            d = d.get("o") or d.get("list") or []
+        rows = []
+        for k in d or []:
+            if isinstance(k, (list, tuple)):
+                rows.append((float(k[1]), float(k[2]), float(k[3]),
+                             float(k[4]), float(k[5])))
+            else:
+                rows.append((float(k.get("open", k.get("o"))),
+                             float(k.get("high", k.get("h"))),
+                             float(k.get("low", k.get("l"))),
+                             float(k.get("close", k.get("c"))),
+                             float(k.get("volume", k.get("v", 0)))))
         rows.sort(key=lambda x: x[0])
         return rows
 
@@ -517,7 +529,7 @@ class BingXAPI:
                      {"symbol": self.fmt(symbol)})
         return float(d[0]["lastPrice"])
 
-    def balance(self):
+        def balance(self):
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
         if isinstance(d, dict):
             for key in ("balance", "usableMargin", "accountMargin"):
