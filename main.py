@@ -638,10 +638,10 @@ class BingXAPI:
         p = {"symbol": self.fmt(symbol),
              "side": "BUY" if side == "Buy" else "SELL",
              "positionSide": "BOTH",
-             "qty": qstr(qty)}
+             "quantity": qstr(qty)}
         if stop:
             p["type"] = "TRIGGER_MARKET"
-            p["stopPrice"] = qstr(stop)
+            p["triggerPrice"] = qstr(stop)
             p["workingType"] = "MARK_PRICE"
         elif tp:
             p["type"] = "LIMIT"
