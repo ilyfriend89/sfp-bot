@@ -49,7 +49,7 @@ TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 �
               "1 час": 60, "4 часа": 240, "1 день": 1440}
 
 # порядок ТФ по возрастанию — для проверки «тренд крупнее рабочего»
-TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут",
+TF_ = ["1 минута", "5 минут", "15 минут", "30 минут",
             "1 час", "4 часа", "1 день"]
 
 BYBIT_ALIASES = {
@@ -251,7 +251,7 @@ class BybitAPI:
                 f = it.get("lotSizeFilter", {})
                 pf = it.get("priceFilter", {})
                 lots[it["symbol"]] = {
-                    "min": float(f.get("minOrderQty") or 0),
+                    "min": float(f.get("minQty") or 0),
                     "qstep": float(f.get("qtyStep") or 0),
                     "tick": float(pf.get("tickSize") or 0),
                     "max": float(f.get("maxMktOrderQty") or 0),
@@ -637,7 +637,7 @@ class BingXAPI:
     def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
         p = {"symbol": self.fmt(symbol),
              "side": "BUY" if side == "Buy" else "SELL",
-             "positionSide": "ONE_WAY",
+             "positionSide": "BOTH",
              "qty": qstr(qty)}
         if stop:
             p["type"] = "TRIGGER_MARKET"
