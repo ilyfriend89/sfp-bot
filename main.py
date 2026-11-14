@@ -16,6 +16,7 @@ import datetime as dt
 from decimal import Decimal, ROUND_DOWN
 import requests
 import flet as ft
+import traceback
 
 WARNING_ISOLATED = ("⚠️ ТОРГОВАТЬ ТОЛЬКО ИЗОЛИРОВАННОЙ МАРЖОЙ (ISOLATED) С ПЛЕЧОМ 5x. "
                     "Размер позиции считает бот из риска (1.5%, компаунд) — "
@@ -126,14 +127,16 @@ def state_save(data):
     except Exception:
         pass
 
-
 def round_step(value, step):
-    if not step or step <= 0:
+    try:
+        if not step or step <= 0:
+            return value
+        s = Decimal(str(step))
+        n = (Decimal(str(value)) / s).to_integral_value(rounding=ROUND_DOWN)
+        return float(n * s)
+    except Exception:
+        print(f"[DEBUG] round_step: value={value!r} step={step!r}", flush=True)
         return value
-    s = Decimal(str(step))
-    n = (Decimal(str(value)) / s).to_integral_value(rounding=ROUND_DOWN)
-    return float(n * s)
-
 
 def qstr(x):
     s = f"{float(x):.10f}".rstrip("0").rstrip(".")
@@ -509,7 +512,7 @@ class BingXAPI:
                       "interval": interval or self.interval,
                       "limit": limit})
         if isinstance(d, dict):
-            d = d.get("data", d)              # разворот оболочки data
+            d = d.get("data", d)
         if isinstance(d, dict):
             d = d.get("o") or d.get("list") or []
         if not isinstance(d, (list, tuple)):
@@ -517,16 +520,19 @@ class BingXAPI:
         rows = []
         for k in d:
             if isinstance(k, (list, tuple)):
-                rows.append((float(k[1]), float(k[2]), float(k[3]),
-                             float(k[4]), float(k[5])))
+                t = float(k[0]) if len(k) > 5 else 0.0
+                rows.append((t, float(k[1]), float(k[2]),
+                             float(k[3]), float(k[4]), float(k[5])))
             else:
-                rows.append((float(k.get("open", k.get("o"))),
+                t = float(k.get("time", k.get("t", 0)) or 0)
+                rows.append((t, float(k.get("open", k.get("o"))),
                              float(k.get("high", k.get("h"))),
                              float(k.get("low", k.get("l"))),
                              float(k.get("close", k.get("c"))),
                              float(k.get("volume", k.get("v", 0)))))
         rows.sort(key=lambda x: x[0])
-        return rows
+        return [(r[1], r[2], r[3], r[4], r[5]) for r in rows]
+      
     def price(self, symbol):
         d = self.req("GET", "/openApi/swap/v2/quote/ticker",
                      {"symbol": self.fmt(symbol)})
@@ -543,19 +549,27 @@ class BingXAPI:
 
     def balance(self):
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
+        print(f"[DEBUG] balance raw: {str(d)[:400]}", flush=True)
         if isinstance(d, dict):
-            d = d.get("data", d)          # снимаем оболочку data
-        if isinstance(d, list):           # вариант: список монет
-            for coin in d:
-                if str(coin.get("coin")) == "USDT":
-                    return float(coin.get("balance") or 0)
-        if isinstance(d, dict):           # вариант: словарь с полями
-            for key in ("balance", "usableMargin", "accountMargin"):
+            inner = d.get("balance")
+            if isinstance(inner, dict):
+                for key in ("balance", "equity", "availableMargin", "available"):
+                    v = inner.get(key)
+                    if isinstance(v, (str, int, float)) and str(v) != "":
+                        return float(v)
+            for key in ("balance", "equity", "availableMargin", "available"):
                 v = d.get(key)
                 if isinstance(v, (str, int, float)) and str(v) != "":
                     return float(v)
+        if isinstance(d, list):
+            for coin in d:
+                if str(coin.get("asset") or coin.get("coin")) == "USDT":
+                    for key in ("balance", "equity", "availableMargin", "available"):
+                        v = coin.get(key)
+                        if isinstance(v, (str, int, float)) and str(v) != "":
+                            return float(v)
         return 0.0
-
+      
     def open_positions(self):
         try:
             d = self.req("GET", "/openApi/swap/v2/user/positions", {})
@@ -1034,7 +1048,8 @@ class Bot:
                 else:
                     self.try_enter(symbol, side, entry, stop, "SFP")
             except Exception as ex:
-                self.log(f"{symbol}: ошибка запроса — {ex}")
+                self.log(f"{symbol}: ошибка запроса — "
+                         f"{type(ex).__name__}: {ex}\n{traceback.format_exc()}")
                 continue
         self.log_stats_if_due()
 
@@ -1077,21 +1092,21 @@ class Bot:
                 bal = self.api.balance()
                 self.log(f"Баланс: {bal:.2f} USDT — API-доступ подтверждён")
             except Exception as ex:
-                self.log(f"[API FAIL] Баланс не получен: {ex}")
+                self.log(f"[API FAIL] Баланс не получен: {ex}\n{traceback.format_exc()}")
         self.recover()
         loop_count = 0
         while not self.stop_event.is_set():
             try:
                 self.manage_positions()
             except Exception as ex:
-                self.log(f"Ошибка сопровождения позиций: {ex}")
+                self.log(f"Ошибка сопровождения позиций: {ex}\n{traceback.format_exc()}")
             loop_count += 1
             if loop_count % 12 == 0:
                 try:
                     self.scan_signals()
                     self.log(f"Цикл выполнен. Открытых позиций: {len(self.positions)}")
                 except Exception as ex:
-                    self.log(f"Ошибка: {ex}")
+                    self.log(f"Ошибка: {ex}\n{traceback.format_exc()}")
             for _ in range(FAST_PERIOD):
                 if self.stop_event.is_set():
                     break
