@@ -438,7 +438,7 @@ class BingXAPI:
 
     def req(self, method, path, params=None):
         last_ex = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 qs, headers = self._query(params or {})
                 url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
@@ -447,7 +447,7 @@ class BingXAPI:
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as ex:
                 last_ex = ex
-                time.sleep(2 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))   # паузы: 2, 4, 6, 8 сек
                 continue
             if not r.text.strip():
                 raise RuntimeError("пустой ответ — проверьте ключ и права")
