@@ -31,6 +31,22 @@ BINGX_DEMO = "https://open-api-vst.bingx.com"
 STATE_FILE = os.path.join(os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd(),
                           "sfp_state.json")
 
+LOG_FILE = os.path.join(os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd(),
+                        "sfp_log.txt")
+LOG_MAX = 200_000   # ~200 КБ, потом обрезаем до последних 100 КБ
+
+def log_to_file(text):
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(data[-LOG_MAX // 2:])
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
+    except Exception:
+        pass
+
 MOSCOW_HINT = ("⏰ v4: килл-зоны отключены — бот торгует круглосуточно (24/7). "
                "Лимит входа ждёт исполнения 3 свечи, затем сигнал отменяется.")
 
