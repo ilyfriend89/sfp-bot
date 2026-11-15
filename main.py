@@ -856,6 +856,34 @@ class Bot:
             if self.api.cancel(symbol, oid):
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
+    def cancel_entry_confirmed(self, symbol, p):
+        """Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых
+        ордеров, что на бирже входных не осталось. False = есть сомнения —
+        слот не освобождается, отмена повторится в следующем цикле."""
+        api = self.api
+        oid = p.get("order_id")
+        if not oid and not DRY_RUN:
+            self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю "
+                     f"по списку открытых ордеров")
+        if oid:
+            if not api.cancel(symbol, oid):
+                self.log(f"{symbol}: отмена ордера {oid} не прошла — "
+                         f"перепроверяю через список ордеров")
+        remaining = api.open_entry_orders(symbol)
+        if remaining is None:
+            self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — "
+                     f"проверьте листики на бирже вручную!")
+            return False
+        ok = True
+        for r in remaining:
+            if api.cancel(symbol, r):
+                self.log(f"{symbol}: снят входной ордер {r}")
+            else:
+                self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} — "
+                         f"ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+                ok = False
+        return ok
+  
     def place_stop(self, symbol, p, qty, stop_price):
         if DRY_RUN:
             return None
