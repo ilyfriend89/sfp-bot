@@ -1255,7 +1255,9 @@ class Bot:
             side, entry, qty = info["side"], info["entry"], info["qty"]
             stop, _ = self.api.pending_exit_prices(sym)
             for oid in self.api.open_reduce_orders(sym):
-                self.api.cancel(sym, oid)
+                if not self.api.cancel(sym, oid):
+                    self.log(f"{sym}: не снят старый ордер {oid} — "
+                             f"проверьте вручную")
             if not stop or stop == entry:
                 stop = entry - entry * 0.01 if side == "LONG" else entry + entry * 0.01
                 self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
