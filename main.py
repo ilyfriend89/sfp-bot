@@ -1518,7 +1518,8 @@ def main(page: ft.Page):
     moscow_note = ft.Text(MOSCOW_HINT, size=14, weight=ft.FontWeight.BOLD)
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
-
+    ui_lock = threading.Lock()
+  
     warning_banner = ft.Container(
         content=ft.Text(WARNING_ISOLATED, color=ft.Colors.BLACK,
                         weight=ft.FontWeight.BOLD),
@@ -1531,16 +1532,16 @@ def main(page: ft.Page):
                                disabled=True)
 
     def add_log(msg):
-        log_view.controls.append(
-            ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
+        with ui_lock:
+            log_view.controls.append(
+                ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
+            page.update()
         tg_send(cfg, msg)
-        page.update()
 
     def on_clear_log(e):
-        log_view.controls.clear()
-        log_view.controls.append(
-            ft.Text(f"{dt.datetime.now():%H:%M:%S}  Журнал очищен (бот продолжает работать)"))
-        page.update()
+        with ui_lock:
+            log_view.controls.clear()
+            page.update()
 
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
               "api_key": api_key, "secret": secret, "symbols": symbols,
@@ -1602,9 +1603,10 @@ def main(page: ft.Page):
     state = {"bot": None, "thread": None, "active": False}
 
     def set_buttons(running):
-        btn_start.disabled = running
-        btn_stop.disabled = not running
-        page.update()
+        with ui_lock:
+            btn_start.disabled = running
+            btn_stop.disabled = not running
+            page.update()
 
     def on_start(e):
         if state["active"]:
