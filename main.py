@@ -754,6 +754,13 @@ class Bot:
         self.stat_r = 0.0
         self.stat_r_usdt = 0.0
 
+    def _log_both(self, msg):
+        try:
+            log_to_file(msg)
+        except Exception:
+            pass
+        self._log_ui(msg)
+  
     def load_losses(self):
         if not self._load_state:
             return
