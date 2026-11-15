@@ -946,7 +946,7 @@ class Bot:
         границей, скорректированной на допуск), объём x1.3 среднего.
         Вход — граница, стоп за границей (+0.8%)."""
         need = self.range_bars + 2
-        c = self.api.candles(symbol, limit=need)
+        c = self.api.candles(symbol, limit=need + 2)
         if len(c) < self.range_bars + 2:
             # ДИАГНОСТИКА: пишем один раз в час на пару, чтобы не засорять журнал
             now = time.time()
@@ -975,7 +975,7 @@ class Bot:
                 last[3] > lower * (1 + tol)):
             return "LONG", lower, lower * (1 - RANGE_STOP_ADD)
         return None, None, None
-
+      
     def try_enter(self, symbol, side, entry, stop, scheme):
         if not isinstance(entry, (int, float)) or not isinstance(stop, (int, float)):
             self.log(f"{symbol}: сигнал с некорректными ценами "
