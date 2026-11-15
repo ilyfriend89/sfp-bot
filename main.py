@@ -903,7 +903,9 @@ class Bot:
             return
         new_stop = self.api.price_ok(symbol, new_stop)
         if p.get("stop_id"):
-            self.api.cancel(symbol, p["stop_id"])
+            if not self.api.cancel(symbol, p["stop_id"]):
+                self.log(f"{symbol}: ВНИМАНИЕ — старый стоп {p['stop_id']} "
+                         f"не снят! Проверьте ордера на бирже вручную")
         p["stop_price"] = new_stop
         p["stop_id"] = None
         oid = self.place_stop(symbol, p, new_qty, new_stop)
