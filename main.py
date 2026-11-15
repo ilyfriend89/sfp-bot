@@ -394,6 +394,19 @@ class BybitAPI:
                 pass
         return out
 
+    def open_entry_orders(self, symbol):
+        try:
+            d = self.req("GET", "/v5/order/realtime",
+                         {"category": "linear", "symbol": self.sym(symbol),
+                          "openOnly": 0, "orderFilter": "Order"})
+        except Exception:
+            return None
+        out = []
+        for o in d.get("list", []):
+            if not o.get("reduceOnly") and o.get("orderId"):
+                out.append(o["orderId"])
+        return out  
+  
     def cancel(self, symbol, order_id):
         try:
             self.req("POST", "/v5/order/cancel",
@@ -650,7 +663,7 @@ class BingXAPI:
         except Exception:
             pass
         return out
-
+ 
     def open_entry_orders(self, symbol):
         """Не-reduceOnly ордера по паре (входные лимиты).
         None = не удалось узнать (сбой сети) — вызывающий код обязан
