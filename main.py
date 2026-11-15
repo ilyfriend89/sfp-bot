@@ -1302,8 +1302,7 @@ class Bot:
             if p.get("phase") == "WAIT_FILL":
                 filled = open_pos.get(symbol) if open_pos is not None else None
                 if filled is not None:
-                    if p.get("order_id"):
-                        self.api.cancel(symbol, p["order_id"])
+                    self.cancel_entry_confirmed(symbol, p)
                     qty = filled["qty"]
                     p["qty_total"] = qty
                     p["qty"] = qty
