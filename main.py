@@ -733,7 +733,8 @@ class Bot:
         self.symbols = symbols
         self.max_losses = max_losses_per_day   # корзинный лимит (v4: 5)
         self.max_positions = max_positions
-        self.log = log
+        self._log_ui = log
+        self.log = self._log_both
         self._load_state = load_state
         self._save_state = save_state
         self.stop_event = threading.Event()
