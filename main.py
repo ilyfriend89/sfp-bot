@@ -437,11 +437,18 @@ class BingXAPI:
                     "X-BX-TIMESTAMP": p["timestamp"]}
 
     def req(self, method, path, params=None):
+        last_ex = None
         for attempt in range(3):
-            qs, headers = self._query(params or {})
-            url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
-            r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
-                else requests.get(url, headers=headers, timeout=15)
+            try:
+                qs, headers = self._query(params or {})
+                url = f"{self.base}{path}?{qs}&signature={headers['X-BX-SIGNATURE']}"
+                r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
+                    else requests.get(url, headers=headers, timeout=15)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as ex:
+                last_ex = ex
+                time.sleep(2 * (attempt + 1))
+                continue
             if not r.text.strip():
                 raise RuntimeError("пустой ответ — проверьте ключ и права")
             d = r.json()
@@ -454,6 +461,8 @@ class BingXAPI:
                     continue
                 raise RuntimeError(f"BingX: {d.get('msg')}")
             return d.get("data")
+        if last_ex is not None:
+            raise RuntimeError(f"сеть: {last_ex}")
         raise RuntimeError("BingX: лимит запросов — пара пропущена")
 
     def fmt(self, symbol):
