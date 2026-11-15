@@ -948,6 +948,15 @@ class Bot:
         need = self.range_bars + 2
         c = self.api.candles(symbol, limit=need)
         if len(c) < self.range_bars + 2:
+            # ДИАГНОСТИКА: пишем один раз в час на пару, чтобы не засорять журнал
+            now = time.time()
+            key = ("range_diag", symbol)
+            if not hasattr(self, "_diag_cache"):
+                self._diag_cache = {}
+            if now - self._diag_cache.get(key, 0) > 3600:
+                self._diag_cache[key] = now
+                self.log(f"{symbol}: ДИАГНОСТИКА range: свечей получено {len(c)} "
+                         f"из {need} — канал не достроен, сигнал не ищем")
             return None, None, None
         hist = c[-(self.range_bars + 2):-2]   # закрытые бары канала
         upper = max(x[1] for x in hist)
@@ -1045,7 +1054,7 @@ class Bot:
                 break
             if self.losses_by_pair.get(symbol, 0) >= MAX_STOPS_PER_PAIR:
                 continue
-            time.sleep(0.5)    # пауза против rate limit (请稍后重试)
+            time.sleep(1.5)    # пауза против rate limit (请稍后重试)
             try:
                 ssig = self.sfp_signal(symbol)
                 if not ssig[0]:
