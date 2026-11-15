@@ -1319,11 +1319,15 @@ class Bot:
                              f"стоп {qstr(p['stop_price'])}, защита выставлена")
                 elif time.time() > p["placed_ts"] + \
                         ENTRY_WAIT * TF_MINUTES.get(self.tf_label, 15) * 60:
-                    if p.get("order_id"):
-                        self.api.cancel(symbol, p["order_id"])
-                    self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} свечей — "
-                             f"сигнал пропущен (не догоняем рынок)")
-                    del self.positions[symbol]
+                    if self.cancel_entry_confirmed(symbol, p):
+                        self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
+                                 f"свечей — сигнал пропущен (не догоняем рынок)")
+                        del self.positions[symbol]
+                    else:
+                        # отмена не подтверждена — НЕ освобождаем слот,
+                        # повторим в следующем цикле (через FAST_PERIOD секунд)
+                        p["placed_ts"] = time.time() - \
+                            (ENTRY_WAIT - 0.2) * TF_MINUTES.get(self.tf_label, 15) * 60
                 continue
 
             info = open_pos.get(symbol) if open_pos is not None else None
