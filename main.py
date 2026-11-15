@@ -651,6 +651,23 @@ class BingXAPI:
             pass
         return out
 
+    def open_entry_orders(self, symbol):
+        """Не-reduceOnly ордера по паре (входные лимиты).
+        None = не удалось узнать (сбой сети) — вызывающий код обязан
+        отнестись к этому как к 'ордера могут быть живы'."""
+        try:
+            d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
+                         {"symbol": self.fmt(symbol)})
+        except Exception:
+            return None
+        out = []
+        for o in d or []:
+            if not (o.get("reduceOnly") in (True, "true", 1)):
+                oid = o.get("orderId") or o.get("id")
+                if oid:
+                    out.append(oid)
+        return out
+  
     def cancel(self, symbol, order_id):
         try:
             self.req("POST", "/openApi/swap/v2/trade/cancelOrder",
