@@ -966,13 +966,31 @@ class Bot:
         touch_up = sum(1 for x in hist if x[1] >= upper * (1 - tol))
         touch_dn = sum(1 for x in hist if x[2] <= lower * (1 + tol))
         last = c[-2]                          # последний ЗАКРЫТЫЙ бар
-        if last[4] <= RANGE_VOL_MULT * avg_vol:
+        vol_ok = last[4] > RANGE_VOL_MULT * avg_vol
+        rev_up = (touch_up >= 2 and last[1] >= upper * (1 - tol) and
+                  last[3] < upper * (1 - tol))
+        rev_dn = (touch_dn >= 2 and last[2] <= lower * (1 + tol) and
+                  last[3] > lower * (1 + tol))
+        if (touch_up >= 2 or touch_dn >= 2) and not (rev_up or rev_dn):
+            # ДИАГНОСТИКА уровня 2: канал с касаниями есть — на каком шаге
+            # сигнал не случился. Пишем раз в час на пару.
+            now = time.time()
+            key = ("range_layer2", symbol)
+            if not hasattr(self, "_diag_cache"):
+                self._diag_cache = {}
+            if now - self._diag_cache.get(key, 0) > 3600:
+                self._diag_cache[key] = now
+                if not vol_ok:
+                    self.log(f"{symbol}: ДИАГНОСТИКА range-2: канал с касаниями есть "
+                             f"(вверх {touch_up}, вниз {touch_dn}), объём не прошёл")
+                else:
+                    self.log(f"{symbol}: ДИАГНОСТИКА range-2: объём прошёл, реверс не "
+                             f"подтвердился: close {last[3]} против верха {upper} / "
+                             f"низа {lower}")
             return None, None, None
-        if (touch_up >= 2 and last[1] >= upper * (1 - tol) and
-                last[3] < upper * (1 - tol)):
+        if rev_up:
             return "SHORT", upper, upper * (1 + RANGE_STOP_ADD)
-        if (touch_dn >= 2 and last[2] <= lower * (1 + tol) and
-                last[3] > lower * (1 + tol)):
+        if rev_dn:
             return "LONG", lower, lower * (1 - RANGE_STOP_ADD)
         return None, None, None
       
