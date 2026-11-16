@@ -595,22 +595,22 @@ class BingXAPI:
                     return float(v)
         return None
 
-def balance(self):
-    try:
-        d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-        if isinstance(d, dict):
-            balance_data = d.get("balance", {})
-            usd_balance = balance_data.get("USDT", 0)
-            if isinstance(usd_balance, (int, float)):
-                return float(usd_balance)
-            # Если USDT баланс не найден, ищем другие способы получения баланса
-            for coin in d.get("list", []):
-                if coin.get("coin") == "USDT":
-                    return float(coin.get("availableMargin", 0))
-        return 0.0
-    except Exception as ex:
-        self.log(f"Ошибка получения баланса: {ex}")
-        return 0.0
+    def balance(self):
+        try:
+            d = self.req("GET", "/openApi/swap/v2/user/balance", {})
+            if isinstance(d, dict):
+                balance_data = d.get("balance", {})
+                usd_balance = balance_data.get("USDT", 0)
+                if isinstance(usd_balance, (int, float)):
+                    return float(usd_balance)
+                # Если USDT баланс не найден, ищем другие способы получения баланса
+                for coin in d.get("list", []):
+                    if coin.get("coin") == "USDT":
+                        return float(coin.get("availableMargin", 0))
+            return 0.0
+        except Exception as ex:
+            self.log(f"Ошибка получения баланса: {ex}")
+            return 0.0
       
     def open_positions(self):
         try:
@@ -770,17 +770,17 @@ class Bot:
             pass
         self._log_ui(msg)
   
-def load_losses(self):
-    if not self._load_state:
-        return
-    try:
-        st = self._load_state()
-        if (isinstance(st, dict) and 
-            st.get("date") == dt.date.today().isoformat()):
-            self.losses_today = int(st.get("losses", 0))
-            self.losses_by_pair = dict(st.get("losses_by_pair") or {})
-    except (TypeError, ValueError):
-        pass
+    def load_losses(self):
+        if not self._load_state:
+            return
+        try:
+            st = self._load_state()
+            if (isinstance(st, dict) and 
+                st.get("date") == dt.date.today().isoformat()):
+                self.losses_today = int(st.get("losses", 0))
+                self.losses_by_pair = dict(st.get("losses_by_pair") or {})
+        except (TypeError, ValueError):
+            pass
 
     def persist_losses(self):
         if not self._save_state:
@@ -872,37 +872,36 @@ def load_losses(self):
             if self.api.cancel(symbol, oid):
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
-def cancel_entry_confirmed(self, symbol, p):
-    """
-    Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых ордеров.
-    Возвращает True, если считаем, что входных ордеров на бирже больше нет.
-    Возвращает False, если есть сомнения (ордера висят или список не получен).
-    """
-    api = self.api
-    oid = p.get("order_id")
-    
-    # 1. Попытка прямой отмены по ID
-    if oid:
-        try:
-            if api.cancel(symbol, oid):
-                self.log(f"{symbol}: ордер {oid} успешно отменен по ID")
-            else:
-                err_msg = str(getattr(api, "last_error", "")).lower()
-                if "not found" in err_msg or "not exist" in err_msg or "не существ" in err_msg:
-                    self.log(f"{symbol}: ордер {oid} уже отсутствовал на бирже (OK)")
+    def cancel_entry_confirmed(self, symbol, p):
+        """
+        Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых ордеров.
+        Возвращает True, если считаем, что входных ордеров на бирже больше нет.
+        Возвращает False, если есть сомнения (ордера висят или список не получен).
+        """
+        api = self.api
+        oid = p.get("order_id")
+        
+        # 1. Попытка прямой отмены по ID
+        if oid:
+            try:
+                if api.cancel(symbol, oid):
+                    self.log(f"{symbol}: ордер {oid} успешно отменен по ID")
                 else:
-                    self.log(f"{symbol}: отмена ордера {oid} не прошла ({err_msg}). Перепроверка списка ордеров...")
+                    err_msg = str(getattr(api, "last_error", "")).lower()
+                    if "not found" in err_msg or "not exist" in err_msg or "не существ" in err_msg:
+                        self.log(f"{symbol}: ордер {oid} уже отсутствовал на бирже (OK)")
+                    else:
+                        self.log(f"{symbol}: отмена ордера {oid} не прошла ({err_msg}). Перепроверка списка ордеров...")
+            except Exception as ex:
+                self.log(f"{symbol}: ошибка при отмене ордера {oid}: {ex}")
+                return False
+
+        # 2. Проверка через список открытых ордеров
+        try:
+            remaining_ids = api.open_entry_orders(symbol)
         except Exception as ex:
-            self.log(f"{symbol}: ошибка при отмене ордера {oid}: {ex}")
+            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот не освобождаем!")
             return False
-
-    # 2. Проверка через список открытых ордеров
-    try:
-        remaining_ids = api.open_entry_orders(symbol)
-    except Exception as ex:
-        self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот не освобождаем!")
-        return False
-
     # Упрощенная проверка результата
     if not isinstance(remaining_ids, list):
         self.log(f"{symbol}: НЕ УДАЛОСЬ ПОЛУЧИТЬ СПИСОК ОРДЕРОВ. Проверьте биржу вручную!")
