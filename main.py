@@ -1751,22 +1751,32 @@ def main(page: ft.Page):
             log_view.controls.clear()
             page.update()
 
-    def picker_result(e: ft.FilePickerResultEvent):
-        if e.path:
+    def on_save_log(e):
+        try:
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
                     data = f.read()
             except Exception:
                 data = "файл sfp_log.txt не найден"
-            try:
-                with open(e.path, "w", encoding="utf-8") as f:
-                    f.write(data)
-                add_log(f"Лог сохранён: {e.path}")
-            except Exception as ex:
-                add_log(f"Не удалось сохранить лог: {ex}")
-
-    picker = ft.FilePicker(on_result=picker_result)
-    page.overlay.append(picker)  
+            dest = None
+            bases = [
+                "/storage/emulated/0/Download",
+                os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd(),
+            ]
+            for base in bases:
+                try:
+                    dest = os.path.join(base, "sfp_log.txt")
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write(data)
+                    break
+                except Exception:
+                    dest = None
+            if dest:
+                add_log(f"Лог сохранён: {dest}")
+            else:
+                add_log("Не удалось сохранить лог — нет доступа к папке")
+        except Exception as ex:
+            add_log(f"Не удалось сохранить лог: {ex}")
   
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
               "api_key": api_key, "secret": secret, "symbols": symbols,
@@ -1929,9 +1939,7 @@ def main(page: ft.Page):
     log_tab = ft.Column([
         ft.Row([
             ft.OutlinedButton("Очистить журнал", on_click=on_clear_log),
-            ft.FilledButton("Сохранить лог",
-                            on_click=lambda e: picker.save_file(
-                                file_name="sfp_log.txt")),
+            ft.FilledButton("Сохранить лог", on_click=on_save_log),
         ]),
         log_view,
     ], spacing=10, expand=True)
