@@ -6,22 +6,6 @@
 #  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
 #  Размер позиции считает бот от риска; плечо задаёт только залог.
 #
-#  ЧТО НОВОГО ПРОТИВ v4 (по результатам разбора):
-#   1. Пол стопа по издержкам: stop >= 10 x (maker+taker+spread).
-#      Узкий стоп 0.8% убран — он отдавал бирже 20% лучшего исхода.
-#   2. RANGE: стоп по ATR, цели по геометрии канала (середина / дальняя
-#      граница), фильтр объёма РАБОТАЕТ, вход на 38% отката свечи.
-#   3. RANGE: фильтр режима — против сильного тренда не торгуем.
-#   4. TREND разделён: A=продолжение (SFP-откат), B=разворот (CHoCH).
-#   5. Выходы шире: 1.5R / 3.0R, хвост 30% трейлится ATR-каналом.
-#   6. Отбор по скорингу всей корзины вместо порядка списка (FIFO).
-#   7. Вытеснение слабых висящих ордеров сильными сигналами.
-#   8. Портфельные лимиты: кластеры, направленная экспозиция, -4R/день.
-#   9. Все ордера с clientOrderId, отмена подтверждается по списку.
-#  10. Стоп переносится БЕЗ окна без защиты (сначала новый, потом отмена).
-#  11. Учёт R/USDT от НЕИЗМЕННОГО исходного риска (баг v4 исправлен).
-#  12. MAE/MFE по каждой сделке в CSV — для настройки стопов по данным.
-#
 #  ФОРМАТ БАРА ВЕЗДЕ: (t_ms, open, high, low, close, volume)
 #  Сигналы считаются по ЗАКРЫТЫМ барам; последний элемент списка —
 #  ещё формирующаяся свеча и в расчёт сигналов не берётся.
@@ -231,6 +215,12 @@ def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
+def _sgn(side):
+    """Направление сделки: +1 для LONG, -1 для SHORT.
+    ВАЖНО: функция уровня модуля, она НЕ метод класса Bot."""
+    return 1 if side == "LONG" else -1
+
+
 def new_client_id(prefix="sfp"):
     return f"{prefix}{int(time.time() * 1000)}"
 
@@ -361,6 +351,8 @@ def score_signal(f):
 
 MOSCOW_HINT = ("⏰ v5: торговля 24/7. Лимит входа ждёт 3 свечи. "
                "Сигналы отбираются по скорингу всей корзины, а не по порядку списка.")
+
+
 # ======================================================================
 #  ЧАСТЬ 2/5: API-слой. Единый интерфейс для Bybit и BingX.
 #  Возврат свечей: (t_ms, open, high, low, close, volume), по возрастанию t.
@@ -983,8 +975,8 @@ class BingXAPI:
                 side = "SHORT"
             else:
                 side = str(p.get("side") or "LONG").upper()
-                if side in ("BUY", "SELL"):
-                    side = "LONG" if side == "BUY" else "SHORT"
+            if side in ("BUY", "SELL"):
+                side = "LONG" if side == "BUY" else "SHORT"
             out[self.to_universal(p.get("symbol", ""))] = {
                 "side": side, "qty": amt, "entry": _f(p.get("avgPrice"))}
         return out
@@ -1086,6 +1078,8 @@ class BingXAPI:
         res = self.req("POST", "/openApi/swap/v2/trade/order", p)
         dbg(f"BingX order {symbol} {p} -> {res}")
         return res
+
+
 # ======================================================================
 #  ЧАСТЬ 3/5: режим рынка и генераторы сигналов.
 #  Сигнал — словарь; конфликты одной пары разрешаются в resolve().
@@ -1195,7 +1189,7 @@ class Signals:
             direction = (1 if slope > 0 else -1) if strength > REGIME_THRESHOLD else 0
             if direction and ema_now > 0:
                 if (direction > 0 and closes[-1] < ema_now) or \
-                   (direction < 0 and closes[-1] > ema_now):
+                        (direction < 0 and closes[-1] > ema_now):
                     direction = 0
         else:
             strength, direction, ema_now = 0.0, 0, (ser[-1] if ser else None)
@@ -1236,7 +1230,7 @@ class Signals:
         # вход на 38% отката сигнальной свечи, а не на самом экстремуме
         rng = max(last[2] - last[3], atr * 0.1)
         entry = last[4] + RANGE_ENTRY_RETRACE * rng if side == "SHORT" else \
-                last[4] - RANGE_ENTRY_RETRACE * rng
+            last[4] - RANGE_ENTRY_RETRACE * rng
         boundary = upper if side == "SHORT" else lower
         beyond = max(last[2], upper) if side == "SHORT" else min(last[3], lower)
         dist = self._stop_dist(entry, atr, RANGE_STOP_ATR, ctx["spread"])
@@ -1330,7 +1324,7 @@ class Signals:
             return None
         slope = es[-1] - es[-2] if len(es) > 1 else 0.0
         conf = (ef[-1] < es[-1] and slope <= 0) if side == "SHORT" else \
-               (ef[-1] > es[-1] and slope >= 0)
+            (ef[-1] > es[-1] and slope >= 0)
         if not conf:
             return None
         entry = mn_lo if side == "SHORT" else mn_hi   # ретест сломанного уровня
@@ -1392,9 +1386,11 @@ class Signals:
         if ctx is None:
             return []
         return self.resolve(symbol, ctx)
+
+
 # ======================================================================
-#  ЧАСТЬ 4/5: ядро бота — состояние, лимиты, отбор сигналов, учёт сделок.
-#  Исполнение ордеров и сопровождение позиций — в части 5.
+#  ЧАСТЬ 4/5 + 5/5: ядро бота — состояние, лимиты, отбор сигналов,
+#  учёт сделок, исполнение ордеров и сопровождение позиций.
 #  В позиции НЕИЗМЕННЫ: entry, risk, stop0, qty_total, tp_levels, splits.
 #  Меняются только: stop_price, qty, tp_filled, tail, mae, mfe.
 # ======================================================================
@@ -1709,17 +1705,12 @@ class Bot:
                 self._acted[s] = bt
                 self.stat_taken += 1
         self.log_stats()
-    # ======================================================================
+
+    # ==================================================================
     #  ЧАСТЬ 5А/5: исполнение ордеров и сопровождение позиций.
     #  Неизменны после входа: entry, risk, stop0, tp_levels, splits.
     #  qty_total фиксируется в момент исполнения и дальше не меняется.
-    # ======================================================================
-def _sgn(side):
-    return 1 if side == "LONG" else -1
-
-
-    # --- методы ниже добавить внутрь класса Bot (отступ 4 пробела) ---
-
+    # ==================================================================
     def _err_kind(self, err):
         e = str(err or "").lower()
         if any(k in e for k in ("not exist", "not found", "does not exist", "no such",
@@ -2115,7 +2106,9 @@ def _sgn(side):
                     self.log(f"{symbol}: DRY лимит не исполнен за {ENTRY_WAIT} "
                              f"свечей — отменён")
                     del self.positions[symbol]
-                continue
+                    continue
+                else:
+                    continue
             if p.get("tail"):
                 ch = self.chandelier(symbol, p)
                 if ch is not None:
@@ -2156,8 +2149,10 @@ def _sgn(side):
                         self.close_trade(symbol, p, "ТЕЙК-ПОЛНЫЙ", p["tp_levels"][-1])
                         del self.positions[symbol]
                     break
-    # --- методы recover и run добавить внутрь класса Bot (отступ 4 пробела) ---
 
+    # ==================================================================
+    #  ЧАСТЬ 5Б/5: восстановление после перезапуска и главный цикл.
+    # ==================================================================
     def recover(self):
         """После перезапуска: позиции под защиту, осиротевшие входные
         лимиты снимаются. None от API = сбой, а не «позиций нет»."""
@@ -2265,7 +2260,7 @@ def _sgn(side):
                 bal = self.api.balance()
                 if bal > 0:
                     self.equity = bal
-                self.log(f"Баланс: {bal:.2f} USDT — API-доступ подтверждён")
+                    self.log(f"Баланс: {bal:.2f} USDT — API-доступ подтверждён")
             except Exception as ex:
                 self.log(f"[API FAIL] Баланс не получен: {ex}")
         self.recover()
@@ -2297,9 +2292,9 @@ def _sgn(side):
         self.log("Бот остановлен")
 
 
-    # ======================================================================
-    #  Оболочка Flet — все 13 полей настроек v4 сохранены
-    # ======================================================================
+# ======================================================================
+#  Оболочка Flet — все 13 полей настроек v4 сохранены
+# ======================================================================
 def tg_send(cfg, text):
     if not cfg.get("token") or not cfg.get("chat"):
         return
@@ -2333,9 +2328,9 @@ def main(page: ft.Page):
         state_save(d)
 
     ex = ft.Dropdown(label="Биржа", options=[ft.dropdown.Option("Bybit"),
-                                            ft.dropdown.Option("BingX")], value="BingX")
+                                             ft.dropdown.Option("BingX")], value="BingX")
     mode = ft.Dropdown(label="Режим", options=[ft.dropdown.Option("Демо"),
-                                              ft.dropdown.Option("Реальный")], value="Демо")
+                                               ft.dropdown.Option("Реальный")], value="Демо")
     tf = ft.Dropdown(label="Таймфрейм",
                      options=[ft.dropdown.Option(k) for k in TIMEFRAMES], value="15 минут")
     trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
@@ -2373,6 +2368,7 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
     ui_lock = threading.Lock()
+
     warning_banner = ft.Container(
         content=ft.Text(WARNING_ISOLATED, color=ft.Colors.BLACK,
                         weight=ft.FontWeight.BOLD),
@@ -2562,9 +2558,9 @@ def main(page: ft.Page):
     log_tab = ft.Column([
         ft.Row([ft.OutlinedButton("Очистить", on_click=lambda e: (
             log_view.controls.clear(), page.update())),
-            ft.FilledButton("Лог", on_click=lambda e: _export(LOG_FILE, "sfp_log.txt")),
-            ft.FilledButton("Сделки", on_click=lambda e: _export(TRADES_FILE,
-                                                                "sfp_trades.csv"))]),
+                ft.FilledButton("Лог", on_click=lambda e: _export(LOG_FILE, "sfp_log.txt")),
+                ft.FilledButton("Сделки", on_click=lambda e: _export(TRADES_FILE,
+                                                                     "sfp_trades.csv"))]),
         log_view,
     ], spacing=10, expand=True)
 
