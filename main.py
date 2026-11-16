@@ -1117,7 +1117,11 @@ class Bot:
             try:
                 res = self.api.order(symbol, "Buy" if side == "LONG" else "Sell",
                                      qty, tp=entry)
-                oid = res.get("orderId") if isinstance(res, dict) else None
+                oid = None
+                if isinstance(res, dict):
+                    oid = (res.get("orderId") or
+                           (res.get("order") or {}).get("orderId") or
+                           (res.get("data") or {}).get("orderId"))
             except Exception as ex:
                 self.log(f"{symbol}: лимит-вход не выставлен — {ex}")
                 return
