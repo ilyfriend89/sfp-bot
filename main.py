@@ -884,40 +884,100 @@ class Bot:
         ордеров, что на бирже входных не осталось. False = есть сомнения —
         слот не освобождается, отмена повторится в следующем цикле.
         'Ордер не найден' в ответе биржи считается успехом (уже снят)."""
+        import time
         api = self.api
         oid = p.get("order_id")
-        if not oid and not DRY_RUN:
+
+        # Если это DRY_RUN, ничего не делаем, считаем успешным
+        if DRY_RUN:
+            return True
+
+        if not oid:
             self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю "
                      f"по списку открытых ордеров")
-        if oid:
-            if not api.cancel(symbol, oid):
+
+        # Вспомогательная функция для одной попытки отмены
+        def attempt_cancel(order_id, attempt_num):
+            try:
+                if api.cancel(symbol, order_id):
+                    self.log(f"{symbol}: ордер {order_id} успешно отменен (попытка {attempt_num})")
+                    return True
+                
                 err = str(getattr(api, "last_error", "") or "").lower()
+                
+                # Если биржа говорит, что ордера нет — значит, он уже закрыт (исполнением или ранее). Это успех.
                 if ("not found" in err or "not exist" in err or
-                        "не существ" in err):
-                    self.log(f"{symbol}: ордер {oid} на бирже уже отсутствует")
+                        "не существ" in err or "order does not exist" in err):
+                    self.log(f"{symbol}: ордер {order_id} на бирже уже отсутствует (OK)")
+                    return True
+                
+                # Если это лимит запросов (Rate Limit) — возвращаем None, чтобы вызвать паузу и повтор
+                if ("too many" in err or "rate limit" in err or "429" in err):
+                    self.log(f"{symbol}: Лимит запросов API при отмене ордера {order_id}. Попытка {attempt_num}. Ждем...")
+                    return None
+                
+                # Любая другая ошибка — это реальная проблема
+                self.log(f"{symbol}: отмена ордера {order_id} не прошла (попытка {attempt_num}): "
+                         f"{getattr(api, 'last_error', 'нет данных')}")
+                return False
+
+            except Exception as ex:
+                self.log(f"{symbol}: Исключение при отмене ордера {order_id}: {ex}")
+                return False
+
+        # 1. Попытка отмены конкретного ордера (если есть ID)
+        if oid:
+            max_retries = 3
+            for i in range(1, max_retries + 1):
+                res = attempt_cancel(oid, i)
+                
+                if res is True:
+                    break  # Успех
+                elif res is False:
+                    break  # Критическая ошибка, дальше не пробуем этот ID
                 else:
-                    self.log(f"{symbol}: отмена ордера {oid} не прошла "
-                             f"({getattr(api, 'last_error', 'нет данных')}) — "
-                             f"перепроверяю через список ордеров")
-        remaining = api.open_entry_orders(symbol)
+                    # Это None (Rate Limit) — ждем и пробуем снова
+                    if i < max_retries:
+                        wait_time = 2 * i  # Пауза 2, 4, 6 сек
+                        self.log(f"{symbol}: Пауза {wait_time} сек из-за лимитов API...")
+                        time.sleep(wait_time)
+                    continue
+
+        # 2. Финальная проверка через список открытых ордеров
+        try:
+            remaining = api.open_entry_orders(symbol)
+        except Exception as ex:
+            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. "
+                     f"Слот НЕ освобождаем!")
+            return False
+
         if remaining is None:
             self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — "
                      f"проверьте листики на бирже вручную!")
             return False
+
         ok = True
         for r in remaining:
-            if api.cancel(symbol, r):
-                self.log(f"{symbol}: снят входной ордер {r}")
-            else:
-                err = str(getattr(api, "last_error", "") or "").lower()
-                if ("not found" in err or "not exist" in err or
-                        "не существ" in err):
-                    self.log(f"{symbol}: ордер {r} на бирже уже отсутствует")
-                else:
-                    self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} "
-                             f"({getattr(api, 'last_error', 'нет данных')}) — "
-                             f"ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+            # Для каждого оставшегося ордера делаем до 2 попыток
+            max_retries = 2
+            for i in range(1, max_retries + 1):
+                res = attempt_cancel(r, i)
+                
+                if res is True:
+                    break
+                elif res is False:
                     ok = False
+                    break
+                else:
+                    # Rate Limit
+                    if i < max_retries:
+                        time.sleep(2 * i)
+                    continue
+            
+            if not ok:
+                self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} — ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+                # Не прерываем цикл, пробуем снять остальные, но итоговый статус будет False
+
         return ok
   
     def place_stop(self, symbol, p, qty, stop_price):
