@@ -1634,6 +1634,23 @@ def main(page: ft.Page):
     # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
     page.padding = 48
 
+    def picker_result(e: ft.FilePickerResultEvent):
+        if e.path:
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    data = f.read()
+            except Exception:
+                data = "файл sfp_log.txt не найден"
+            try:
+                with open(e.path, "w", encoding="utf-8") as f:
+                    f.write(data)
+                add_log(f"Лог сохранён: {e.path}")
+            except Exception as ex:
+                add_log(f"Не удалось сохранить лог: {ex}")
+
+    picker = ft.FilePicker(on_result=picker_result)
+    page.overlay.append(picker)
+  
     def load_profiles():
         return state_load().get("profiles") or {}
 
