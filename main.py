@@ -882,7 +882,8 @@ class Bot:
     def cancel_entry_confirmed(self, symbol, p):
         """Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых
         ордеров, что на бирже входных не осталось. False = есть сомнения —
-        слот не освобождается, отмена повторится в следующем цикле."""
+        слот не освобождается, отмена повторится в следующем цикле.
+        'Ордер не найден' в ответе биржи считается успехом (уже снят)."""
         api = self.api
         oid = p.get("order_id")
         if not oid and not DRY_RUN:
@@ -890,8 +891,14 @@ class Bot:
                      f"по списку открытых ордеров")
         if oid:
             if not api.cancel(symbol, oid):
-                self.log(f"{symbol}: отмена ордера {oid} не прошла — "
-                         f"перепроверяю через список ордеров")
+                err = str(getattr(api, "last_error", "") or "").lower()
+                if ("not found" in err or "not exist" in err or
+                        "не существ" in err):
+                    self.log(f"{symbol}: ордер {oid} на бирже уже отсутствует")
+                else:
+                    self.log(f"{symbol}: отмена ордера {oid} не прошла "
+                             f"({getattr(api, 'last_error', 'нет данных')}) — "
+                             f"перепроверяю через список ордеров")
         remaining = api.open_entry_orders(symbol)
         if remaining is None:
             self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — "
@@ -902,9 +909,15 @@ class Bot:
             if api.cancel(symbol, r):
                 self.log(f"{symbol}: снят входной ордер {r}")
             else:
-                self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} — "
-                         f"ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
-                ok = False
+                err = str(getattr(api, "last_error", "") or "").lower()
+                if ("not found" in err or "not exist" in err or
+                        "не существ" in err):
+                    self.log(f"{symbol}: ордер {r} на бирже уже отсутствует")
+                else:
+                    self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} "
+                             f"({getattr(api, 'last_error', 'нет данных')}) — "
+                             f"ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+                    ok = False
         return ok
   
     def place_stop(self, symbol, p, qty, stop_price):
