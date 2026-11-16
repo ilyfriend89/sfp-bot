@@ -679,26 +679,28 @@ class BingXAPI:
         return out
  
     def open_entry_orders(self, symbol):
-        """Не-reduceOnly ордера по паре (входные лимиты).
-        None = не удалось узнать (сбой сети) — вызывающий код обязан
-        отнестись к этому как к 'ордера могут быть живы'."""
         try:
             d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
                          {"symbol": self.fmt(symbol)})
         except Exception:
+            return None  # Возвращаем None при ошибке
+        
+        if d is None:  # Проверка на None после запроса
             return None
+            
         if isinstance(d, dict):
             d = d.get("orders") or d.get("data") or d.get("list") or []
         if not isinstance(d, (list, tuple)):
             d = []
+            
         out = []
         for o in d:
-            if not (o.get("reduceOnly") in (True, "true", 1)):
+            if not o.get("reduceOnly") in (True, "true", 1):
                 oid = o.get("orderId") or o.get("id")
                 if oid:
                     out.append(oid)
         return out
-  
+
     def cancel(self, symbol, order_id):
         try:
             self.req("POST", "/openApi/swap/v2/trade/cancelOrder",
@@ -727,6 +729,7 @@ class BingXAPI:
         if reduce_only:
             p["reduceOnly"] = True
         return self.req("POST", "/openApi/swap/v2/trade/order", p)
+
 class Bot:
     def __init__(self, api, tf_label, trend_label, symbols, risk_pct,
                  max_losses_per_day, max_positions, log,
@@ -885,27 +888,41 @@ class Bot:
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
     def cancel_entry_confirmed(self, symbol, p):
-        import time
-        api = self.api
-        oid = p.get("order_id")
-
-        if DRY_RUN:
-            return True
-
-        # Проверка открытых позиций перед отменой
         try:
-            positions = api.open_positions()
-            if symbol in positions:
-                self.log(f"{symbol}: Позиция уже открыта, отмена не требуется")
-                return False
+            oids = self.api.open_entry_orders(symbol)
         except Exception as ex:
-            self.log(f"{symbol}: Ошибка при проверке позиций: {ex}")
+            self.log(f"{symbol}: не удалось получить ордера для снятия — {ex}")
             return False
 
-        if not oid:
-            self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю по списку открытых ордеров")
+        if oids is None:  # Если API вернул None, считаем что ордера могут быть
+            self.log(f"{symbol}: ошибка получения открытых ордеров — считаем активными")
+            return False
 
-        def attempt_cancel(order_id, attempt_num):
+        if not oids:  # Если список пустой, значит ордеров нет
+            self.log(f"{symbol}: открытых лимит-ордеров не обнаружено")
+            return True
+
+        for oid in oids:
+            if not self.api.cancel(symbol, oid):
+                self.log(f"{symbol}: не удалось отменить ордер {oid}")
+                return False
+
+        # Повторная проверка после отмены
+        try:
+            remaining = self.api.open_entry_orders(symbol)
+        except Exception as ex:
+            self.log(f"{symbol}: ошибка при повторной проверке — {ex}")
+            return False
+
+        if remaining is None or remaining:
+            self.log(f"{symbol}: после отмены обнаружены оставшиеся ордера {remaining}")
+            return False
+
+        self.log(f"{symbol}: лимит-ордера успешно отменены")
+        return True
+
+
+    def attempt_cancel(order_id, attempt_num):
             try:
                 if api.cancel(symbol, order_id):
                     self.log(f"{symbol}: ордер {order_id} успешно отменен (попытка {attempt_num})")
@@ -973,6 +990,16 @@ class Bot:
             
             if not ok:
                 self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} — ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+
+        # Дополнительная проверка после всех попыток отмены
+        try:
+            final_check = api.open_entry_orders(symbol)
+            if final_check:
+                self.log(f"{symbol}: ПОСЛЕДНЯЯ ПРОВЕРКА — ОРДЕРА ВСЕ ЕЩЕ СУЩЕСТВУЮТ: {final_check}")
+                ok = False
+        except Exception as ex:
+            self.log(f"{symbol}: ОШИБКА ПРИ ФИНАЛЬНОЙ ПРОВЕРКЕ ОРДЕРОВ: {ex}")
+            ok = False
 
         return ok
   
@@ -1885,7 +1912,11 @@ def main(page: ft.Page):
                   load_state=load_state, save_state=save_state)
         cfg["token"] = tg_token.value.strip()
         cfg["chat"] = tg_chat.value.strip()
-        state["bot"] = bot
+        state["bot"] = Bot(api, tf.value, trend_tf.value, pairs,
+                          risk,
+                          int(losses.value), int(maxpos.value), add_log,
+                          ema_proximity_pct=prox,
+                          load_state=load_state, save_state=save_state)
         state["active"] = True
         state["thread"] = threading.Thread(target=bot.run, daemon=True)
         state["thread"].start()
