@@ -443,6 +443,7 @@ class BingXAPI:
         self.aliases = BINGX_ALIASES
         self.reverse = {v: k for k, v in BINGX_ALIASES.items()}
         self._lots = None
+        self.last_error = None
 
     def sym(self, s):
         return self.aliases.get(s, s)
@@ -697,8 +698,10 @@ class BingXAPI:
         try:
             self.req("POST", "/openApi/swap/v2/trade/cancelOrder",
                      {"symbol": self.fmt(symbol), "orderId": str(order_id)})
+            self.last_error = None
             return True
-        except Exception:
+        except Exception as ex:
+            self.last_error = f"{type(ex).__name__}: {ex}"
             return False
 
     def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False):
