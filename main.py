@@ -450,6 +450,7 @@ class BingXAPI:
 
     def to_universal(self, s):
         s = self.reverse.get(s, s)
+        s = s.replace("-", "")          # BingX отдаёт TRX-USDT — убираем дефис
         for q in ("USDT", "USDC", "BTC"):
             if s.endswith(q):
                 return s[:-len(q)] + q
@@ -623,13 +624,17 @@ class BingXAPI:
             d = self.req("GET", "/openApi/swap/v2/user/positions", {})
         except Exception:
             return {}
+
         out = {}
         for p in d or []:
             amt = abs(float(p.get("positionAmt", 0) or 0))
             if amt == 0:
                 continue
-            out[self.to_universal(p["symbol"])] = {
-                "side": p.get("side", "LONG").upper(),
+            formatted_symbol = self.to_universal(p.get("symbol", ""))
+            log_to_file(f"DEBUG: позиция на бирже — {formatted_symbol}, "
+                        f"объём {amt}, вход {p.get('avgPrice', 0)}")
+            out[formatted_symbol] = {
+                "side": str(p.get("side", "LONG")).upper(),
                 "qty": amt,
                 "entry": float(p.get("avgPrice", 0) or 0),
             }
@@ -880,23 +885,26 @@ class Bot:
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
     def cancel_entry_confirmed(self, symbol, p):
-        """Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых
-        ордеров, что на бирже входных не осталось. False = есть сомнения —
-        слот не освобождается, отмена повторится в следующем цикле.
-        'Ордер не найден' в ответе биржи считается успехом (уже снят)."""
         import time
         api = self.api
         oid = p.get("order_id")
 
-        # Если это DRY_RUN, ничего не делаем, считаем успешным
         if DRY_RUN:
             return True
 
-        if not oid:
-            self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю "
-                     f"по списку открытых ордеров")
+        # Проверка открытых позиций перед отменой
+        try:
+            positions = api.open_positions()
+            if symbol in positions:
+                self.log(f"{symbol}: Позиция уже открыта, отмена не требуется")
+                return False
+        except Exception as ex:
+            self.log(f"{symbol}: Ошибка при проверке позиций: {ex}")
+            return False
 
-        # Вспомогательная функция для одной попытки отмены
+        if not oid:
+            self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю по списку открытых ордеров")
+
         def attempt_cancel(order_id, attempt_num):
             try:
                 if api.cancel(symbol, order_id):
@@ -905,60 +913,50 @@ class Bot:
                 
                 err = str(getattr(api, "last_error", "") or "").lower()
                 
-                # Если биржа говорит, что ордера нет — значит, он уже закрыт (исполнением или ранее). Это успех.
                 if ("not found" in err or "not exist" in err or
-                        "не существ" in err or "order does not exist" in err):
+                    "не существ" in err or "order does not exist" in err):
                     self.log(f"{symbol}: ордер {order_id} на бирже уже отсутствует (OK)")
                     return True
                 
-                # Если это лимит запросов (Rate Limit) — возвращаем None, чтобы вызвать паузу и повтор
                 if ("too many" in err or "rate limit" in err or "429" in err):
                     self.log(f"{symbol}: Лимит запросов API при отмене ордера {order_id}. Попытка {attempt_num}. Ждем...")
                     return None
                 
-                # Любая другая ошибка — это реальная проблема
-                self.log(f"{symbol}: отмена ордера {order_id} не прошла (попытка {attempt_num}): "
-                         f"{getattr(api, 'last_error', 'нет данных')}")
+                self.log(f"{symbol}: отмена ордера {order_id} не прошла (попытка {attempt_num}): {getattr(api, 'last_error', 'нет данных')}")
                 return False
 
             except Exception as ex:
                 self.log(f"{symbol}: Исключение при отмене ордера {order_id}: {ex}")
                 return False
 
-        # 1. Попытка отмены конкретного ордера (если есть ID)
         if oid:
             max_retries = 3
             for i in range(1, max_retries + 1):
                 res = attempt_cancel(oid, i)
                 
                 if res is True:
-                    break  # Успех
+                    break
                 elif res is False:
-                    break  # Критическая ошибка, дальше не пробуем этот ID
+                    break
                 else:
-                    # Это None (Rate Limit) — ждем и пробуем снова
                     if i < max_retries:
-                        wait_time = 2 * i  # Пауза 2, 4, 6 сек
+                        wait_time = 2 * i
                         self.log(f"{symbol}: Пауза {wait_time} сек из-за лимитов API...")
                         time.sleep(wait_time)
                     continue
 
-        # 2. Финальная проверка через список открытых ордеров
         try:
             remaining = api.open_entry_orders(symbol)
         except Exception as ex:
-            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. "
-                     f"Слот НЕ освобождаем!")
+            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот НЕ освобождаем!")
             return False
 
         if remaining is None:
-            self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — "
-                     f"проверьте листики на бирже вручную!")
+            self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — проверьте листики на бирже вручную!")
             return False
 
         ok = True
         for r in remaining:
-            # Для каждого оставшегося ордера делаем до 2 попыток
             max_retries = 2
             for i in range(1, max_retries + 1):
                 res = attempt_cancel(r, i)
@@ -969,14 +967,12 @@ class Bot:
                     ok = False
                     break
                 else:
-                    # Rate Limit
                     if i < max_retries:
                         time.sleep(2 * i)
-                    continue
+                continue
             
             if not ok:
                 self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} — ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
-                # Не прерываем цикл, пробуем снять остальные, но итоговый статус будет False
 
         return ok
   
@@ -1294,51 +1290,31 @@ class Bot:
         self.log(f"Бот запущен ({self.api.base}). {mode_info}. ТФ: {self.tf_label}")
         self.log(f"v4: килл-зоны отключены, торговля 24/7. Конфликт сигналов: "
                  f"совпадение -> ДИАПАЗОН, разнонаправленные -> пропуск")
-        self.log(f"Диапазон: канал {RANGE_DAYS} дн. ({self.range_bars} бар), "
-                 f"касания >=2, объём x{RANGE_VOL_MULT}, вход лимитом по границе, "
-                 f"стоп за границей (+{RANGE_STOP_ADD * 100:.1f}%), "
-                 f"тейки 0.5R/1.0R долями 1/2, 1/2, BE сразу после ТП1")
-        self.log(f"SFP-тренд: свинг {SFP_SWING} бар, объём x{self.vol_mult}, "
-                 f"{trend_info}. Тейки 1.0R (1/2) и 1.6R (1/4), BE после ТП1, "
-                 f"хвост 25% трейлингом EMA{TREND_TRAIL_EMA}")
-        self.log(f"Риск {self.deposit_pct * 100:.1f}% КОМПАУНД от текущего баланса "
-                 f"(плечо расчёта до x{RISK_CAP_LEVERAGE:.0f}). "
-                 f"Вход лимитом, ожидание {ENTRY_WAIT} свечей. "
-                 f"Лимиты стопов: {MAX_STOPS_PER_PAIR}/пара, "
-                 f"{self.max_losses}/корзина в день. "
-                 f"Пары: {', '.join(self.symbols)}. "
-                 f"Лимит позиций: {self.max_positions}. "
-                 f"Позиции проверяются каждые {FAST_PERIOD} сек")
-        self.log(MOSCOW_HINT)
-        if DRY_RUN:
-            self.log(f"DRY-RUN: стартовый баланс {DRY_RUN_BALANCE:.0f} USDT "
-                     f"(компаунд), риск {DRY_RUN_BALANCE * self.deposit_pct:.2f} "
-                     f"USDT на первую сделку")
-        else:
-            try:
-                bal = self.api.balance()
-                self.log(f"Баланс: {bal:.2f} USDT — API-доступ подтверждён")
-            except Exception as ex:
-                self.log(f"[API FAIL] Баланс не получен: {ex}\n{traceback.format_exc()}")
-        self.recover()
+
         loop_count = 0
         while not self.stop_event.is_set():
             try:
                 self.manage_positions()
             except Exception as ex:
                 self.log(f"Ошибка сопровождения позиций: {ex}\n{traceback.format_exc()}")
+
             loop_count += 1
             if loop_count % 12 == 0:
+                pending = [s for s, p in self.positions.items()
+                           if p.get("phase") == "WAIT_FILL"]
+                if pending:
+                    self.log(f"DEBUG: ожидают исполнения лимит-входы: "
+                             f"{', '.join(pending)}")
                 try:
                     self.scan_signals()
                     self.log(f"Цикл выполнен. Открытых позиций: {len(self.positions)}")
                 except Exception as ex:
                     self.log(f"Ошибка: {ex}\n{traceback.format_exc()}")
+
             for _ in range(FAST_PERIOD):
                 if self.stop_event.is_set():
                     break
                 time.sleep(1)
-        self.log("Бот остановлен")
 
     def recover(self):
         if DRY_RUN:
@@ -1406,7 +1382,22 @@ class Bot:
             if p.get("phase") == "WAIT_FILL":
                 filled = open_pos.get(symbol) if open_pos is not None else None
                 if filled is not None:
-                    self.cancel_entry_confirmed(symbol, p)
+                    # позиция жива — снимаем остаток входного ордера напрямую
+                    oid = p.get("order_id")
+                    if oid:
+                        try:
+                            if self.api.cancel(symbol, oid):
+                                self.log(f"{symbol}: остаток входного ордера снят")
+                        except Exception as ex:
+                            self.log(f"{symbol}: остаток входного ордера не снят: {ex}")
+                    try:
+                        for r in (self.api.open_entry_orders(symbol) or []):
+                            try:
+                                self.api.cancel(symbol, r)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     qty = filled["qty"]
                     p["qty_total"] = qty
                     p["qty"] = qty
