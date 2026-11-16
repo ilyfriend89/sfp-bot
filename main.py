@@ -640,7 +640,11 @@ class BingXAPI:
         try:
             d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
                          {"symbol": sym})
-            for o in d or []:
+            if isinstance(d, dict):
+                d = d.get("orders") or d.get("data") or d.get("list") or []
+            if not isinstance(d, (list, tuple)):
+                d = []
+            for o in d:
                 if o.get("reduceOnly") in (True, "true", 1):
                     if o.get("type") == "TRIGGER_MARKET" and o.get("stopPrice"):
                         stop = float(o["stopPrice"])
@@ -655,7 +659,11 @@ class BingXAPI:
         try:
             d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
                          {"symbol": self.fmt(symbol)})
-            for o in d or []:
+            if isinstance(d, dict):
+                d = d.get("orders") or d.get("data") or d.get("list") or []
+            if not isinstance(d, (list, tuple)):
+                d = []
+            for o in d:
                 if o.get("reduceOnly") in (True, "true", 1):
                     oid = o.get("orderId") or o.get("id")
                     if oid:
@@ -673,8 +681,12 @@ class BingXAPI:
                          {"symbol": self.fmt(symbol)})
         except Exception:
             return None
+        if isinstance(d, dict):
+            d = d.get("orders") or d.get("data") or d.get("list") or []
+        if not isinstance(d, (list, tuple)):
+            d = []
         out = []
-        for o in d or []:
+        for o in d:
             if not (o.get("reduceOnly") in (True, "true", 1)):
                 oid = o.get("orderId") or o.get("id")
                 if oid:
