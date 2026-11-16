@@ -1,3 +1,366 @@
+# -*- coding: utf-8 -*-
+# ======================================================================
+#  SFP-бот v5  —  Bybit / BingX  —  оболочка Flet (настройки v4 сохранены)
+#  ЧАСТЬ 1/5: конфигурация, индикаторы, утилиты
+#
+#  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
+#  Размер позиции считает бот от риска; плечо задаёт только залог.
+#
+#  ЧТО НОВОГО ПРОТИВ v4 (по результатам разбора):
+#   1. Пол стопа по издержкам: stop >= 10 x (maker+taker+spread).
+#      Узкий стоп 0.8% убран — он отдавал бирже 20% лучшего исхода.
+#   2. RANGE: стоп по ATR, цели по геометрии канала (середина / дальняя
+#      граница), фильтр объёма РАБОТАЕТ, вход на 38% отката свечи.
+#   3. RANGE: фильтр режима — против сильного тренда не торгуем.
+#   4. TREND разделён: A=продолжение (SFP-откат), B=разворот (CHoCH).
+#   5. Выходы шире: 1.5R / 3.0R, хвост 30% трейлится ATR-каналом.
+#   6. Отбор по скорингу всей корзины вместо порядка списка (FIFO).
+#   7. Вытеснение слабых висящих ордеров сильными сигналами.
+#   8. Портфельные лимиты: кластеры, направленная экспозиция, -4R/день.
+#   9. Все ордера с clientOrderId, отмена подтверждается по списку.
+#  10. Стоп переносится БЕЗ окна без защиты (сначала новый, потом отмена).
+#  11. Учёт R/USDT от НЕИЗМЕННОГО исходного риска (баг v4 исправлен).
+#  12. MAE/MFE по каждой сделке в CSV — для настройки стопов по данным.
+#
+#  ФОРМАТ БАРА ВЕЗДЕ: (t_ms, open, high, low, close, volume)
+#  Сигналы считаются по ЗАКРЫТЫМ барам; последний элемент списка —
+#  ещё формирующаяся свеча и в расчёт сигналов не берётся.
+# ======================================================================
+import os
+import csv
+import json
+import time
+import hmac
+import hashlib
+import urllib.parse
+import threading
+import traceback
+import datetime as dt
+from decimal import Decimal, ROUND_DOWN
+
+import requests
+import flet as ft
+
+WARNING_ISOLATED = ("⚠️ ТОРГОВАТЬ ТОЛЬКО ИЗОЛИРОВАННОЙ МАРЖОЙ (ISOLATED) С ПЛЕЧОМ 5x. "
+                    "Размер позиции считает бот из риска — плечо задаёт только залог.")
+
+BYBIT_REAL = "https://api.bybit.com"
+BYBIT_DEMO = "https://api-demo.bybit.com"
+BINGX_REAL = "https://open-api.bingx.com"
+BINGX_DEMO = "https://open-api-vst.bingx.com"
+
+_DATA_DIR = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
+STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
+LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
+TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
+LOG_MAX = 200_000
+
+DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
+DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
+DRY_RUN_BALANCE = 1000.0
+
+# ------------------- ТАЙМФРЕЙМЫ (множители объёма SFP как в v4) -------------------
+TIMEFRAMES = {
+    "1 минута": {"interval_bybit": "1",   "interval_bingx": "1m",  "vol_mult": 3.0},
+    "5 минут":  {"interval_bybit": "5",   "interval_bingx": "5m",  "vol_mult": 2.8},
+    "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 1.5},
+    "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
+    "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
+    "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
+    "1 день":   {"interval_bybit": "D",   "interval_bingx": "1d",  "vol_mult": 1.2},
+}
+TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 минут": 30,
+              "1 час": 60, "4 часа": 240, "1 день": 1440}
+TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "1 день"]
+
+BYBIT_ALIASES = {
+    "PEPEUSDT": "1000PEPEUSDT", "BONKUSDT": "1000BONKUSDT",
+    "FLOKIUSDT": "1000FLOKIUSDT", "SHIBUSDT": "1000SHIBUSDT",
+    "PUMPUSDT": "1000PUMPUSDT", "WLFIUSDT": "1000WLFIUSDT",
+}
+BINGX_ALIASES = {
+    "PEPEUSDT": "1000PEPEUSDT", "PUMPUSDT": "1000PUMPUSDT",
+}
+
+# ------------------- ИНДИКАТОРЫ / РЕЖИМ -------------------
+EMA_PERIOD = 50            # EMA фильтра тренда на тренд-ТФ
+EMA_FAST = 20              # быстрая EMA на рабочем ТФ (подтверждение разворота)
+EMA_OFF = "Выключен"
+ATR_PERIOD = 14
+REGIME_LOOKBACK = 10       # баров тренд-ТФ для замера наклона EMA50
+REGIME_THRESHOLD = 1.5     # |наклон| / ATR_htf выше -> сильный тренд
+HTF_BARS = 160             # запас свечей тренд-ТФ
+WORK_BARS = 320            # запас свечей рабочего ТФ
+
+# ------------------- ИЗДЕРЖКИ (пол стопа) -------------------
+FEE_MAKER = 0.0002         # 0.02% — вход и тейки (лимиты)
+FEE_TAKER = 0.0005         # 0.05% — стоп (маркет). Bybit taker 0.055%
+COST_STOP_MULT = 10.0      # stop >= 10 x издержек -> издержки <= 0.10R
+MAX_SPREAD_PCT = 0.30      # спред шире -> пара непригодна, пропуск
+
+# ------------------- СХЕМЫ ВЫХОДОВ v5 -------------------
+TP_TREND = [(1.5, 0.40), (3.0, 0.30)]   # хвост 0.30 трейлится ATR-каналом
+TREND_TAIL_SHARE = 0.30
+CHANDELIER_LOOKBACK = 22
+CHANDELIER_ATR = 3.0
+TREND_BE_AFTER_TP1 = 0.0       # стоп в безубыток после ТП1 (ТП1 далеко, 1.5R)
+
+RANGE_TP1_SHARE = 0.50
+RANGE_TP2_SHARE = 0.50
+RANGE_BE_AFTER_TP1 = -0.30     # стоп в -0.3R, НЕ полный безубыток
+RANGE_MIN_TP1_R = 1.2          # середина канала ближе -> пропуск
+RANGE_MIN_TP2_R = 2.5          # дальняя граница ближе -> пропуск
+RANGE_TARGET_FRAC = 0.90       # фронт-ранним дальнюю границу на 10%
+RANGE_MIN_WIDTH_R = 3.5        # ширина канала >= 3.5 x стоп
+RANGE_STOP_ATR = 0.6
+RANGE_ENTRY_RETRACE = 0.38     # вход на 38% отката сигнальной свечи
+RANGE_DAYS = 3
+RANGE_TOUCH_TOL = 0.0015
+RANGE_VOL_MULT = 1.3           # ТЕПЕРЬ РЕАЛЬНО ПРИМЕНЯЕТСЯ
+RANGE_MIN_TOUCHES = 2
+
+SFP_SWING = 20                 # TREND-A: окно свинга
+SFP_STOP_ATR = 0.5
+CHOCH_SWING = 60               # TREND-B: мажорный свинг
+CHOCH_MINOR = 10               # минорный свинг для слома структуры
+CHOCH_STOP_ATR = 0.6
+CHOCH_COUNTER_SIZE = 0.70      # размер против режима
+
+# ------------------- РИСК / ЛИМИТЫ -------------------
+RISK_PCT_DEFAULT = 0.010       # 1% на период валидации (в поле можно 0.015)
+RISK_CAP_LEVERAGE = 5.0        # не выше плеча в приложении биржи
+ENTRY_WAIT = 3                 # свечей ожидания лимит-входа
+FAST_PERIOD = 5                # секунд между проверками позиций
+CANCEL_RETRY_SEC = 20          # повтор неподтверждённой отмены
+MAX_STOPS_PER_PAIR = 3
+MAX_STOPS_BASKET = 5
+DAILY_R_LIMIT = -4.0           # убыток дня в R -> новых входов нет
+PAIR_COOLDOWN_HOURS = 4
+PAIR_COOLDOWN_STOPS = 2
+MAX_TOTAL_RISK = 0.025         # суммарный открытый риск, доля эквити
+MAX_SAME_DIR_RISK = 0.020      # риск в одну сторону
+
+# ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
+SCORE_W_VOL = 0.30
+SCORE_W_DEPTH = 0.20
+SCORE_W_ROOM = 0.25
+SCORE_W_ALIGN = 0.15
+SCORE_W_COST = 0.25
+SCORE_CONFLUENCE = 0.10
+PREEMPT_ENABLED = True
+PREEMPT_SCORE_RATIO = 1.25
+PREEMPT_MIN_AGE_BARS = 1
+CONFLUENCE_SIZE_MULT = 1.00    # бонус размера ВЫКЛЮЧЕН до проверки на истории
+
+# ------------------- КЛАСТЕРЫ КОРРЕЛЯЦИИ -------------------
+CLUSTERS = {
+    "MAJORS": ("BTCUSDT", "ETHUSDT"),
+    "LARGE": ("SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT",
+              "LINKUSDT", "LTCUSDT", "BCHUSDT", "ETCUSDT", "ATOMUSDT", "XLMUSDT",
+              "HBARUSDT", "ALGOUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "NEARUSDT",
+              "APTUSDT", "SUIUSDT", "TRXUSDT", "POLUSDT", "UNIUSDT", "AAVEUSDT"),
+    "MEME": ("DOGEUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+             "SHIBUSDT", "JUPUSDT", "TIAUSDT", "SEIUSDT", "INJUSDT", "ENAUSDT",
+             "PUMPUSDT", "WLFIUSDT", "SUSDT", "ASTERUSDT", "NIGHTUSDT"),
+    "AI": ("FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT"),
+    "DEFI": ("CRVUSDT", "LDOUSDT", "ARBUSDT", "OPUSDT"),
+    "OTHER": ("ZECUSDT", "HYPEUSDT", "XPLUSDT"),
+}
+_CLUSTER_MAP = {s: c for c, arr in CLUSTERS.items() for s in arr}
+
+
+def cluster_of(symbol):
+    return _CLUSTER_MAP.get(symbol, "OTHER")
+
+
+# ------------------- УТИЛИТЫ -------------------
+def log_to_file(text):
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(data[-LOG_MAX // 2:])
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
+    except Exception:
+        pass
+
+
+def dbg(text):
+    if DEBUG_API:
+        try:
+            log_to_file("[DEBUG] " + str(text)[:700])
+        except Exception:
+            pass
+
+
+def state_load():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def state_save(data):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def round_step(value, step):
+    try:
+        if not step or step <= 0:
+            return value
+        s = Decimal(str(step))
+        n = (Decimal(str(value)) / s).to_integral_value(rounding=ROUND_DOWN)
+        return float(n * s)
+    except Exception:
+        return value
+
+
+def qstr(x):
+    s = f"{float(x):.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def new_client_id(prefix="sfp"):
+    return f"{prefix}{int(time.time() * 1000)}"
+
+
+def extract_order_id(res):
+    """orderId из любого формата ответа: dict / вложенность / список / скаляр."""
+    if res is None:
+        return None
+    if isinstance(res, (str, int)):
+        s = str(res).strip()
+        return s or None
+    if isinstance(res, (list, tuple)):
+        for it in res:
+            v = extract_order_id(it)
+            if v:
+                return v
+        return None
+    if isinstance(res, dict):
+        for k in ("orderId", "order_id", "orderID", "id"):
+            v = res.get(k)
+            if isinstance(v, (str, int)) and str(v).strip():
+                return str(v).strip()
+        for k in ("order", "data", "result"):
+            v = extract_order_id(res.get(k))
+            if v:
+                return v
+    return None
+
+
+def is_reduce(o):
+    return o.get("reduceOnly") in (True, "true", "True", 1, "1")
+
+
+def order_ids(o):
+    oid = o.get("orderId") or o.get("id") or ""
+    cid = o.get("clientOrderId") or o.get("orderLinkId") or ""
+    return str(oid), str(cid)
+
+
+DEAD_STATUSES = ("filled", "cancelled", "canceled", "rejected",
+                 "expired", "deactivated", "failed")
+
+
+def order_alive(o):
+    st = str(o.get("status") or o.get("orderStatus") or "").lower()
+    return st not in DEAD_STATUSES
+
+
+def tf_ms(label):
+    return TF_MINUTES[label] * 60 * 1000
+
+
+# ------------------- ИНДИКАТОРЫ -------------------
+def true_ranges(bars):
+    out = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i][2], bars[i][3], bars[i - 1][4]
+        out.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return out
+
+
+def atr_last(bars, period=ATR_PERIOD):
+    """ATR Уайлдера по закрытым барам. bars: (t,o,h,l,c,v)."""
+    tr = true_ranges(bars)
+    if len(tr) < period:
+        return None
+    a = sum(tr[:period]) / period
+    for x in tr[period:]:
+        a = (a * (period - 1) + x) / period
+    return a
+
+
+def ema(values, period):
+    """EMA с сидом SMA первых period значений (как в v4)."""
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def ema_series(values, n):
+    if len(values) < n:
+        return []
+    k = 2.0 / (n + 1)
+    out, e = [], values[0]
+    for v in values:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def calc_tps(entry, risk, side, offsets):
+    """Тейки по смещениям в R от НЕИЗМЕННОГО исходного риска."""
+    if side == "LONG":
+        return [entry + o * risk for o in offsets]
+    return [entry - o * risk for o in offsets]
+
+
+def cost_floor_frac(spread):
+    """Минимальная дистанция стопа (доля цены), чтобы издержки <= 0.10R."""
+    sp = spread if (spread and spread > 0) else 0.0002
+    return COST_STOP_MULT * (FEE_MAKER + FEE_TAKER + sp)
+
+
+def cost_ratio(stop_frac, spread):
+    """Издержки в долях R — ключевая метрика качества сетапа."""
+    if stop_frac <= 0:
+        return 1.0
+    sp = spread if (spread and spread > 0) else 0.0002
+    return (FEE_MAKER + FEE_TAKER + sp) / stop_frac
+
+
+def score_signal(f):
+    """Скоринг сетапа. Признаки нормированы в [0,1].
+    Веса — априорные; подлежат проверке на истории, не догма."""
+    s = (SCORE_W_VOL * clamp(f.get("vol_z", 0.0))
+         + SCORE_W_DEPTH * clamp(f.get("depth", 0.0))
+         + SCORE_W_ROOM * clamp(f.get("room", 0.0))
+         + SCORE_W_ALIGN * clamp(f.get("align", 0.0))
+         - SCORE_W_COST * clamp(f.get("cost", 0.0)))
+    if f.get("confluence"):
+        s += SCORE_CONFLUENCE
+    return s
+
+
+MOSCOW_HINT = ("⏰ v5: торговля 24/7. Лимит входа ждёт 3 свечи. "
+               "Сигналы отбираются по скорингу всей корзины, а не по порядку списка.")
 # ======================================================================
 #  ЧАСТЬ 2/5: API-слой. Единый интерфейс для Bybit и BingX.
 #  Возврат свечей: (t_ms, open, high, low, close, volume), по возрастанию t.
@@ -724,547 +1087,6 @@ class BingXAPI:
         dbg(f"BingX order {symbol} {p} -> {res}")
         return res
 # ======================================================================
-#  ЧАСТЬ 2/5: API. База + адаптеры Bybit / BingX.
-#  Свечи: (t_ms, o, h, l, c, v). open_positions() -> None = СБОЙ, не «нет позиций».
-#  all_open_orders() -> нормализованные словари:
-#    {oid, cid, reduce, alive, type: STOP|LIMIT|MARKET, price, trigger}
-# ======================================================================
-RATE_HINTS = ("too many", "rate", "429", "稍后", "retry", "frequent", "limit")
-
-
-def _f(x, d=0.0):
-    try:
-        return float(x) if x not in (None, "") else d
-    except Exception:
-        return d
-
-
-class BaseAPI:
-    name = "?"
-
-    def __init__(self, api_key, secret, base, interval, aliases):
-        self.api_key, self.secret = api_key, secret
-        self.base, self.interval = base, interval
-        self.aliases = aliases
-        self.reverse = {v: k for k, v in aliases.items()}
-        self._lots, self._kcache, self._tick = None, {}, (0.0, {})
-        self.last_error = None
-
-    def sym(self, s):
-        return self.aliases.get(s, s)
-
-    def to_universal(self, s):
-        return self.reverse.get(s, s.replace("-", ""))
-
-    def _try(self, path, params, tag):
-        try:
-            res = self.req("POST", path, params)
-            dbg(f"{self.name} {tag} {params} -> {res}")
-            self.last_error = None
-            return True, res
-        except Exception as ex:
-            self.last_error = f"{type(ex).__name__}: {ex}"
-            dbg(f"{self.name} {tag} FAIL {params} -> {self.last_error}")
-            return False, None
-
-    # --- округления ---
-    def qty_ok(self, symbol, qty, price=None):
-        i = self.lot_info(symbol)
-        if not i:
-            return round(qty, 3)
-        qty = round_step(qty, i["qstep"])
-        if i.get("max") and qty > i["max"]:
-            qty = round_step(i["max"], i["qstep"])
-        if qty < i["min"]:
-            return 0.0
-        if price and i.get("min_usdt") and qty * price < i["min_usdt"]:
-            return 0.0
-        return qty
-
-    def price_ok(self, symbol, price):
-        if not isinstance(price, (int, float)):
-            return None
-        i = self.lot_info(symbol)
-        return round_step(price, i["tick"]) if (i and i.get("tick")) else round(price, 8)
-
-    # --- рыночные данные ---
-    @staticmethod
-    def _rows(d):
-        out = []
-        for k in d or []:
-            if isinstance(k, (list, tuple)) and len(k) >= 6:
-                out.append((_f(k[0]), _f(k[1]), _f(k[2]), _f(k[3]), _f(k[4]), _f(k[5])))
-            elif isinstance(k, dict):
-                out.append((_f(k.get("time", k.get("t", k.get("startTime")))),
-                            _f(k.get("open", k.get("o"))), _f(k.get("high", k.get("h"))),
-                            _f(k.get("low", k.get("l"))), _f(k.get("close", k.get("c"))),
-                            _f(k.get("volume", k.get("v")))))
-        out = sorted([r for r in out if r[0] > 0 and r[4] > 0], key=lambda x: x[0])
-        ded = []
-        for r in out:
-            if not ded or r[0] != ded[-1][0]:
-                ded.append(r)
-        return ded
-
-    def klines(self, symbol, limit=WORK_BARS, interval=None, max_age_ms=0):
-        iv = str(interval or self.interval)
-        key = (self.sym(symbol), iv, int(limit))
-        now = int(time.time() * 1000)
-        hit = self._kcache.get(key)
-        if hit and now - hit[0] < max_age_ms:
-            return hit[1]
-        bars = self._rows(self._klines_raw(symbol, int(limit), iv))
-        self._kcache[key] = (now, bars)
-        return bars
-
-    @staticmethod
-    def _spread(bid, ask):
-        return (ask - bid) / ((ask + bid) / 2) if (bid > 0 and ask > bid) else 0.0
-
-    def tickers(self, symbols, max_age_ms=10000):
-        now = time.time()
-        if self._tick[1] and (now - self._tick[0]) * 1000 < max_age_ms:
-            return self._tick[1]
-        out = self._tickers_raw()
-        if not out:
-            for s in symbols:
-                q = self._quote_one(s)
-                if q:
-                    out[s] = q
-                time.sleep(0.12)
-        if out:
-            self._tick = (now, out)
-        return out or self._tick[1]
-
-    def quote(self, symbol):
-        t = self.tickers([symbol]).get(symbol)
-        return t if (t and t.get("last")) else self._quote_one(symbol)
-
-    def price(self, symbol):
-        q = self.quote(symbol)
-        return q["last"] if q and q.get("last") else None
-
-    # --- ордера: общее поверх нормализованного вида ---
-    def open_reduce_orders(self, symbol):
-        return [(o["oid"], o["cid"]) for o in (self.all_open_orders(symbol) or [])
-                if o["reduce"]]
-
-    def open_entry_orders(self, symbol):
-        arr = self.all_open_orders(symbol)
-        if arr is None:
-            return None
-        return [(o["oid"], o["cid"]) for o in arr if not o["reduce"] and o["alive"]]
-
-    def pending_exit_prices(self, symbol):
-        stop = tp = None
-        for o in self.all_open_orders(symbol) or []:
-            if not o["reduce"]:
-                continue
-            if o["type"] == "STOP" and stop is None and o["trigger"]:
-                stop = o["trigger"]
-            elif o["type"] == "LIMIT" and tp is None and o["price"]:
-                tp = o["price"]
-        return stop, tp
-
-
-class BybitAPI(BaseAPI):
-    name = "Bybit"
-
-    def __init__(self, api_key, secret, demo, interval):
-        super().__init__(api_key, secret, BYBIT_DEMO if demo else BYBIT_REAL,
-                         interval, BYBIT_ALIASES)
-
-    def _headers(self, payload):
-        ts = str(int(time.time() * 1000))
-        sign = hmac.new(self.secret.encode(),
-                        (ts + self.api_key + "5000" + payload).encode(),
-                        hashlib.sha256).hexdigest()
-        return {"X-BAPI-API-KEY": self.api_key, "X-BAPI-TIMESTAMP": ts,
-                "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": sign,
-                "Content-Type": "application/json"}
-
-    def req(self, method, path, params=None):
-        params = params or {}
-        auth = bool(self.api_key and self.secret) or not path.startswith("/v5/market/")
-        last = None
-        for a in range(4):
-            try:
-                if method == "GET":
-                    qs = urllib.parse.urlencode(params)
-                    r = requests.get(f"{self.base}{path}?{qs}",
-                                     headers=self._headers(qs) if auth else {}, timeout=15)
-                else:
-                    body = json.dumps(params)
-                    r = requests.post(f"{self.base}{path}", data=body,
-                                      headers=self._headers(body) if auth else {}, timeout=15)
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout) as ex:
-                last = ex
-                time.sleep(1.5 * (a + 1))
-                continue
-            if not r.text.strip():
-                raise RuntimeError("пустой ответ — проверьте ключ и права")
-            d = r.json()
-            if d.get("retCode") != 0:
-                m = str(d.get("retMsg") or "")
-                if any(k in m.lower() for k in RATE_HINTS) and a < 3:
-                    time.sleep(1.5 * (a + 1))
-                    continue
-                raise RuntimeError(f"Bybit: {m} ({d.get('retCode')})")
-            self.last_error = None
-            return d.get("result")
-        raise RuntimeError(f"сеть: {last}" if last else "Bybit: лимит запросов")
-
-    def lot_info(self, symbol):
-        if self._lots is None:
-            self._lots = {}
-            try:
-                d = self.req("GET", "/v5/market/instruments-info", {"category": "linear"})
-                for it in (d or {}).get("list", []):
-                    f, pf = it.get("lotSizeFilter", {}), it.get("priceFilter", {})
-                    self._lots[it["symbol"]] = {
-                        "min": _f(f.get("minOrderQty")), "qstep": _f(f.get("qtyStep")),
-                        "tick": _f(pf.get("tickSize")),
-                        "max": _f(f.get("maxMktOrderQty")), "min_usdt": 0.0}
-            except Exception as ex:
-                self.last_error = str(ex)
-        s = self.sym(symbol)
-        if s in self._lots:
-            return self._lots[s]
-        try:
-            d = self.req("GET", "/v5/market/instruments-info",
-                         {"category": "linear", "symbol": s})
-            it = (d or {}).get("list", [{}])[0]
-            f, pf = it.get("lotSizeFilter", {}), it.get("priceFilter", {})
-            info = {"min": _f(f.get("minOrderQty")), "qstep": _f(f.get("qtyStep")),
-                    "tick": _f(pf.get("tickSize")),
-                    "max": _f(f.get("maxMktOrderQty")), "min_usdt": 0.0}
-            self._lots[s] = info
-            return info
-        except Exception:
-            return None
-
-    # --- рыночные данные ---
-    def _klines_raw(self, symbol, limit, iv):
-        d = self.req("GET", "/v5/market/kline",
-                     {"category": "linear", "symbol": self.sym(symbol),
-                      "interval": iv, "limit": limit})
-        return (d or {}).get("list", [])
-
-    def _tk(self, t):
-        b, a = _f(t.get("bid1Price")), _f(t.get("ask1Price"))
-        return {"last": _f(t.get("lastPrice")), "bid": b, "ask": a,
-                "spread": self._spread(b, a)}
-
-    def _tickers_raw(self):
-        try:
-            d = self.req("GET", "/v5/market/tickers", {"category": "linear"})
-            return {self.to_universal(t["symbol"]): self._tk(t)
-                    for t in (d or {}).get("list", [])}
-        except Exception as ex:
-            self.last_error = str(ex)
-            return {}
-
-    def _quote_one(self, symbol):
-        try:
-            d = self.req("GET", "/v5/market/tickers",
-                         {"category": "linear", "symbol": self.sym(symbol)})
-            arr = (d or {}).get("list", [])
-            return self._tk(arr[0]) if arr else None
-        except Exception:
-            return None
-
-    def balance(self):
-        for acct in ("UNIFIED", "CONTRACT"):
-            try:
-                d = self.req("GET", "/v5/account/wallet-balance", {"accountType": acct})
-                for c in (d or {}).get("list", [{}])[0].get("coin", []):
-                    if c.get("coin") == "USDT" and _f(c.get("walletBalance")) > 0:
-                        return _f(c["walletBalance"])
-            except Exception:
-                continue
-        return 0.0
-
-    def open_positions(self):
-        try:
-            d = self.req("GET", "/v5/position/list",
-                         {"category": "linear", "settleCoin": "USDT"})
-        except Exception as ex:
-            self.last_error = str(ex)
-            return None
-        out = {}
-        for p in (d or {}).get("list", []):
-            q = _f(p.get("size"))
-            if q:
-                out[self.to_universal(p["symbol"])] = {
-                    "side": "LONG" if p.get("side") == "Buy" else "SHORT",
-                    "qty": q, "entry": _f(p.get("avgPrice"))}
-        return out
-
-    def all_open_orders(self, symbol):
-        out, ok = [], False
-        for filt in ("Order", "StopOrder"):
-            try:
-                d = self.req("GET", "/v5/order/realtime",
-                             {"category": "linear", "symbol": self.sym(symbol),
-                              "openOnly": 0, "orderFilter": filt})
-                ok = True
-            except Exception as ex:
-                self.last_error = str(ex)
-                continue
-            for o in (d or {}).get("list", []):
-                oid, cid = order_ids(o)
-                trg = _f(o.get("triggerPrice"))
-                out.append({"oid": oid, "cid": cid, "reduce": is_reduce(o),
-                            "alive": order_alive(o),
-                            "type": "STOP" if trg else
-                                    ("LIMIT" if o.get("orderType") == "Limit" else "MARKET"),
-                            "price": _f(o.get("price")), "trigger": trg})
-        return out if ok else None
-
-    def cancel(self, symbol, order_id=None, client_id=None):
-        p = {"category": "linear", "symbol": self.sym(symbol)}
-        if order_id:
-            p["orderId"] = str(order_id)
-        elif client_id:
-            p["orderLinkId"] = str(client_id)
-        else:
-            self.last_error = "нет orderId/orderLinkId"
-            return False
-        return self._try("/v5/order/cancel", p, "cancel")[0]
-
-    def cancel_all(self, symbol):
-        return self._try("/v5/order/cancel-all",
-                         {"category": "linear", "symbol": self.sym(symbol),
-                          "orderFilter": "Order"}, "cancel-all")[0]
-
-    def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False,
-              client_id=None):
-        p = {"category": "linear", "symbol": self.sym(symbol), "side": side,
-             "qty": qstr(qty), "positionIdx": 0}
-        if client_id:
-            p["orderLinkId"] = str(client_id)
-        if stop:
-            p.update(orderType="Market", triggerPrice=qstr(stop), triggerBy="LastPrice",
-                     triggerDirection="2" if side == "Sell" else "1")
-        elif tp:
-            p.update(orderType="Limit", price=qstr(tp), timeInForce="GTC")
-        else:
-            p["orderType"] = "Market"
-        if reduce_only:
-            p["reduceOnly"] = True
-        ok, res = self._try("/v5/order/create", p, "order")
-        if not ok:
-            raise RuntimeError(self.last_error)
-        return res
-
-
-class BingXAPI(BaseAPI):
-    name = "BingX"
-
-    def __init__(self, api_key, secret, demo, interval):
-        super().__init__(api_key, secret, BINGX_DEMO if demo else BINGX_REAL,
-                         interval, BINGX_ALIASES)
-
-    def fmt(self, symbol):
-        s = self.sym(symbol)
-        for q in ("USDT", "USDC", "BTC"):
-            if s.endswith(q):
-                return s[:-len(q)] + "-" + q
-        return s
-
-    def req(self, method, path, params=None):
-        params = params or {}
-        auth = bool(self.api_key and self.secret) or "/quote/" not in path
-        last = None
-        for a in range(4):
-            try:
-                if auth:
-                    p = dict(params, timestamp=str(int(time.time() * 1000)),
-                             recvWindow="5000")
-                    qs = urllib.parse.urlencode(sorted(p.items()))
-                    sig = hmac.new(self.secret.encode(), qs.encode(),
-                                   hashlib.sha256).hexdigest()
-                    url = f"{self.base}{path}?{qs}&signature={sig}"
-                    h = {"X-BX-APIKEY": self.api_key}
-                else:
-                    url = f"{self.base}{path}?{urllib.parse.urlencode(sorted(params.items()))}"
-                    h = {}
-                r = requests.post(url, headers=h, timeout=15) if method == "POST" \
-                    else requests.get(url, headers=h, timeout=15)
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout) as ex:
-                last = ex
-                time.sleep(1.5 * (a + 1))
-                continue
-            if not r.text.strip():
-                raise RuntimeError("пустой ответ — проверьте ключ и права")
-            d = r.json()
-            if d.get("code") != 0:
-                m = str(d.get("msg") or "")
-                if any(k in m.lower() for k in RATE_HINTS) and a < 3:
-                    time.sleep(1.5 * (a + 1))
-                    continue
-                raise RuntimeError(f"BingX: {m} ({d.get('code')})")
-            self.last_error = None
-            return d.get("data")
-        raise RuntimeError(f"сеть: {last}" if last else "BingX: лимит запросов")
-
-    @staticmethod
-    def _unwrap(d, keys=("orders", "data", "list", "orderList", "o")):
-        for _ in range(3):
-            if not isinstance(d, dict):
-                break
-            nxt = next((d[k] for k in keys if k in d), None)
-            d = nxt if nxt is not None else []
-        return d if isinstance(d, (list, tuple)) else []
-
-    def lot_info(self, symbol):
-        if self._lots is None:
-            self._lots = {}
-            try:
-                for it in self.req("GET", "/openApi/swap/v2/quote/contracts", {}) or []:
-                    s = (it.get("symbol") or "").replace("-", "")
-                    pq = int(_f(it.get("quantityPrecision"), 8))
-                    pp = int(_f(it.get("pricePrecision"), 8))
-                    self._lots[s] = {
-                        "min": _f(it.get("tradeMinQuantity")),
-                        "qstep": 10 ** (-pq) if pq > 0 else 1.0,
-                        "tick": 10 ** (-pp) if pp > 0 else 0.0,
-                        "max": 0.0, "min_usdt": _f(it.get("tradeMinUSDT"))}
-            except Exception as ex:
-                self.last_error = str(ex)
-                self._lots = None
-        return (self._lots or {}).get(self.sym(symbol))
-
-    # --- рыночные данные ---
-    def _klines_raw(self, symbol, limit, iv):
-        d = self.req("GET", "/openApi/swap/v3/quote/klines",
-                     {"symbol": self.fmt(symbol), "interval": iv, "limit": limit})
-        return self._unwrap(d) or (d if isinstance(d, list) else [])
-
-    def _tk(self, t):
-        b = _f(t.get("bidPrice", t.get("bid1Price")))
-        a = _f(t.get("askPrice", t.get("ask1Price")))
-        return {"last": _f(t.get("lastPrice", t.get("price"))), "bid": b, "ask": a,
-                "spread": self._spread(b, a)}
-
-    def _tickers_raw(self):
-        try:
-            d = self.req("GET", "/openApi/swap/v2/quote/ticker", {})
-            out = {}
-            for t in self._unwrap(d):
-                if isinstance(t, dict):
-                    q = self._tk(t)
-                    if q["last"] > 0:
-                        out[self.to_universal(t.get("symbol", ""))] = q
-            return out
-        except Exception as ex:
-            self.last_error = str(ex)
-            return {}
-
-    def _quote_one(self, symbol):
-        try:
-            d = self.req("GET", "/openApi/swap/v2/quote/ticker",
-                         {"symbol": self.fmt(symbol)})
-            arr = self._unwrap(d) or ([d] if isinstance(d, dict) else [])
-            q = self._tk(arr[0]) if arr else None
-            return q if q and q["last"] > 0 else None
-        except Exception:
-            return None
-
-    def balance(self):
-        d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-        keys = ("balance", "equity", "availableMargin", "available")
-        src = d.get("balance") if isinstance(d, dict) and \
-            isinstance(d.get("balance"), dict) else d
-        if isinstance(src, dict):
-            for k in keys:
-                if _f(src.get(k)) > 0:
-                    return _f(src[k])
-        for c in (d if isinstance(d, list) else []):
-            if str(c.get("asset") or c.get("coin")) == "USDT":
-                for k in keys:
-                    if _f(c.get(k)) > 0:
-                        return _f(c[k])
-        return 0.0
-
-    def open_positions(self):
-        try:
-            d = self.req("GET", "/openApi/swap/v2/user/positions", {})
-        except Exception as ex:
-            self.last_error = str(ex)
-            return None
-        out = {}
-        for p in d or []:
-            if not isinstance(p, dict):
-                continue
-            raw = _f(p.get("positionAmt"))
-            q = abs(raw)
-            if not q:
-                continue
-            ps = str(p.get("positionSide") or "").upper()
-            side = ps if ps in ("LONG", "SHORT") else ("SHORT" if raw < 0 else "LONG")
-            out[self.to_universal(p.get("symbol", ""))] = {
-                "side": side, "qty": q, "entry": _f(p.get("avgPrice"))}
-        return out
-
-    def all_open_orders(self, symbol):
-        try:
-            d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
-                         {"symbol": self.fmt(symbol)})
-        except Exception as ex:
-            self.last_error = str(ex)
-            return None
-        out = []
-        for o in self._unwrap(d):
-            if not isinstance(o, dict):
-                continue
-            oid, cid = order_ids(o)
-            t = str(o.get("type") or "").upper()
-            out.append({"oid": oid, "cid": cid, "reduce": is_reduce(o),
-                        "alive": order_alive(o),
-                        "type": "STOP" if "TRIGGER" in t else
-                                ("LIMIT" if t == "LIMIT" else "MARKET"),
-                        "price": _f(o.get("price")),
-                        "trigger": _f(o.get("stopPrice") or o.get("triggerPrice"))})
-        return out
-
-    def cancel(self, symbol, order_id=None, client_id=None):
-        p = {"symbol": self.fmt(symbol)}
-        if order_id:
-            p["orderId"] = str(order_id)
-        elif client_id:
-            p["clientOrderId"] = str(client_id)
-        else:
-            self.last_error = "нет orderId/clientOrderId"
-            return False
-        return self._try("/openApi/swap/v2/trade/cancelOrder", p, "cancel")[0]
-
-    def cancel_all(self, symbol):
-        return self._try("/openApi/swap/v2/trade/cancelAllOpenOrders",
-                         {"symbol": self.fmt(symbol)}, "cancel-all")[0]
-
-    def order(self, symbol, side, qty, stop=None, tp=None, reduce_only=False,
-              client_id=None):
-        p = {"symbol": self.fmt(symbol), "side": "BUY" if side == "Buy" else "SELL",
-             "positionSide": "BOTH", "quantity": qstr(qty)}
-        if client_id:
-            p["clientOrderId"] = str(client_id)
-        if stop:
-            p.update(type="TRIGGER_MARKET", triggerPrice=qstr(stop),
-                     workingType="MARK_PRICE")
-        elif tp:
-            p.update(type="LIMIT", price=qstr(tp), timeInForce="GTC")
-        else:
-            p["type"] = "MARKET"
-        if reduce_only:
-            p["reduceOnly"] = "true"
-        ok, res = self._try("/openApi/swap/v2/trade/order", p, "order")
-        if not ok:
-            raise RuntimeError(self.last_error)
-        return res
-# ======================================================================
 #  ЧАСТЬ 3/5: режим рынка и генераторы сигналов.
 #  Сигнал — словарь; конфликты одной пары разрешаются в resolve().
 #  Отбор между парами (скоринг + портфельные лимиты) — в части 4.
@@ -1564,6 +1386,7 @@ class Signals:
         if not self._no_chase(out, ctx["regime"]):
             return []
         return [out]
+
     def candidates(self, symbol):
         ctx = self.context(symbol)
         if ctx is None:
