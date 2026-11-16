@@ -44,8 +44,8 @@ def log_to_file(text):
                 f.write(data[-LOG_MAX // 2:])
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
-    except Exception:
-        pass
+    except IOError as ex:
+        print(f"Ошибка записи в лог: {ex}")
 
 MOSCOW_HINT = ("⏰ v4: килл-зоны отключены — бот торгует круглосуточно (24/7). "
                "Лимит входа ждёт исполнения 3 свечи, затем сигнал отменяется.")
@@ -595,27 +595,21 @@ class BingXAPI:
                     return float(v)
         return None
 
-    def balance(self):
+def balance(self):
+    try:
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
-        print(f"[DEBUG] balance raw: {str(d)[:400]}", flush=True)
         if isinstance(d, dict):
-            inner = d.get("balance")
-            if isinstance(inner, dict):
-                for key in ("balance", "equity", "availableMargin", "available"):
-                    v = inner.get(key)
-                    if isinstance(v, (str, int, float)) and str(v) != "":
-                        return float(v)
-            for key in ("balance", "equity", "availableMargin", "available"):
-                v = d.get(key)
-                if isinstance(v, (str, int, float)) and str(v) != "":
-                    return float(v)
-        if isinstance(d, list):
-            for coin in d:
-                if str(coin.get("asset") or coin.get("coin")) == "USDT":
-                    for key in ("balance", "equity", "availableMargin", "available"):
-                        v = coin.get(key)
-                        if isinstance(v, (str, int, float)) and str(v) != "":
-                            return float(v)
+            balance_data = d.get("balance", {})
+            usd_balance = balance_data.get("USDT", 0)
+            if isinstance(usd_balance, (int, float)):
+                return float(usd_balance)
+            # Если USDT баланс не найден, ищем другие способы получения баланса
+            for coin in d.get("list", []):
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("availableMargin", 0))
+        return 0.0
+    except Exception as ex:
+        self.log(f"Ошибка получения баланса: {ex}")
         return 0.0
       
     def open_positions(self):
@@ -776,18 +770,17 @@ class Bot:
             pass
         self._log_ui(msg)
   
-    def load_losses(self):
-        if not self._load_state:
-            return
-        try:
-            st = self._load_state()
-            if st and st.get("date") == dt.date.today().isoformat():
-                self.losses_today = int(st.get("losses", 0))
-                self.losses_by_pair = dict(st.get("losses_by_pair") or {})
-                if self.losses_today:
-                    self.log(f"Восстановлен счётчик стопов за сегодня: {self.losses_today}")
-        except Exception:
-            pass
+def load_losses(self):
+    if not self._load_state:
+        return
+    try:
+        st = self._load_state()
+        if (isinstance(st, dict) and 
+            st.get("date") == dt.date.today().isoformat()):
+            self.losses_today = int(st.get("losses", 0))
+            self.losses_by_pair = dict(st.get("losses_by_pair") or {})
+    except (TypeError, ValueError):
+        pass
 
     def persist_losses(self):
         if not self._save_state:
@@ -879,55 +872,55 @@ class Bot:
             if self.api.cancel(symbol, oid):
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
-    def cancel_entry_confirmed(self, symbol, p):
-        """
-        Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых ордеров.
-        Возвращает True, если считаем, что входных ордеров на бирже больше нет.
-        Возвращает False, если есть сомнения (ордера висят или список не получен).
-        """
-        api = self.api
-        oid = p.get("order_id")
-        
-        # 1. Попытка прямой отмены по ID
-        if oid:
+def cancel_entry_confirmed(self, symbol, p):
+    """
+    Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых ордеров.
+    Возвращает True, если считаем, что входных ордеров на бирже больше нет.
+    Возвращает False, если есть сомнения (ордера висят или список не получен).
+    """
+    api = self.api
+    oid = p.get("order_id")
+    
+    # 1. Попытка прямой отмены по ID
+    if oid:
+        try:
             if api.cancel(symbol, oid):
                 self.log(f"{symbol}: ордер {oid} успешно отменен по ID")
-                # Если отмена прошла успешно, считаем, что все чисто. 
-                # Но для надежности все равно проверим список ниже.
             else:
                 err_msg = str(getattr(api, "last_error", "")).lower()
-                # Если биржа говорит "не найден" или "не существует" - это успех!
                 if "not found" in err_msg or "not exist" in err_msg or "не существ" in err_msg:
                     self.log(f"{symbol}: ордер {oid} уже отсутствовал на бирже (OK)")
                 else:
                     self.log(f"{symbol}: отмена ордера {oid} не прошла ({err_msg}). Перепроверка списка ордеров...")
-
-        # 2. Перепроверка через список открытых ордеров
-        try:
-            remaining_ids = api.open_entry_orders(symbol)
         except Exception as ex:
-            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот не освобождаем!")
+            self.log(f"{symbol}: ошибка при отмене ордера {oid}: {ex}")
             return False
 
-        # Если API вернул None, значит, мы не можем проверить состояние. 
-        # В этом случае безопаснее НЕ освобождать слот, чтобы не наплодить позиций.
-        if remaining_ids is None:
-            self.log(f"{symbol}: НЕ УДАЛОСЬ ПОЛУЧИТЬ СПИСОК ОРДЕРОВ. Проверьте биржу вручную!")
-            return False
+    # 2. Проверка через список открытых ордеров
+    try:
+        remaining_ids = api.open_entry_orders(symbol)
+    except Exception as ex:
+        self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот не освобождаем!")
+        return False
 
-        # Фильтруем: оставляем только те ID, которые реально являются входными лимитами
-        # и которые НЕ совпадают с тем, который мы только что пытались снять (на случай рассинхрона)
-        active_entry_ids = [r for r in remaining_ids if r != oid]
+    # Упрощенная проверка результата
+    if not isinstance(remaining_ids, list):
+        self.log(f"{symbol}: НЕ УДАЛОСЬ ПОЛУЧИТЬ СПИСОК ОРДЕРОВ. Проверьте биржу вручную!")
+        return False
 
-        if not active_entry_ids:
-            self.log(f"{symbol}: Проверка списка ордеров: активных входных ордеров не найдено. Слот свободен.")
-            return True
+    # Фильтрация активных ордеров
+    active_entry_ids = [r for r in remaining_ids if r != oid]
 
-        # 3. Если в списке остались ордера, пытаемся снять их принудительно
-        self.log(f"{symbol}: Обнаружены активные входные ордера: {active_entry_ids}. Попытка массовой отмены...")
-        all_removed = True
-        
-        for r_id in active_entry_ids:
+    if not active_entry_ids:
+        self.log(f"{symbol}: Проверка списка ордеров: активных входных ордеров не найдено. Слот свободен.")
+        return True
+
+    # 3. Массовая отмена оставшихся ордеров
+    self.log(f"{symbol}: Обнаружены активные входные ордера: {active_entry_ids}. Попытка массовой отмены...")
+    all_removed = True
+    
+    for r_id in active_entry_ids:
+        try:
             if api.cancel(symbol, r_id):
                 self.log(f"{symbol}: снят входной ордер {r_id}")
             else:
@@ -937,20 +930,26 @@ class Bot:
                 else:
                     self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r_id} ({err_msg}) — ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
                     all_removed = False
-        
-        # Если после всех попыток что-то осталось, возвращаем False, чтобы слот не освобождался
-        if not all_removed:
-            return False
-            
-        # Финальная проверка: если мы сняли все, что нашли, пробуем еще раз получить список
-        # (защита от гонки данных)
+        except Exception as ex:
+            self.log(f"{symbol}: ошибка при отмене ордера {r_id}: {ex}")
+            all_removed = False
+
+    # Финальная проверка
+    if not all_removed:
+        return False
+
+    # Повторная проверка списка ордеров
+    try:
         final_check = api.open_entry_orders(symbol)
         if final_check and len(final_check) > 0:
             self.log(f"{symbol}: ВНИМАНИЕ: после массовой отмены в списке еще есть ордера: {final_check}. Слот НЕ освобождаем.")
             return False
+    except Exception as ex:
+        self.log(f"{symbol}: ошибка при финальной проверке: {ex}")
+        return False
 
-        self.log(f"{symbol}: Все входные ордера успешно сняты или отсутствовали. Слот освобожден.")
-        return True
+    self.log(f"{symbol}: Все входные ордера успешно сняты или отсутствовали. Слот освобожден.")
+    return True
   
     def place_stop(self, symbol, p, qty, stop_price):
         if DRY_RUN:
@@ -1615,9 +1614,11 @@ class Bot:
                     self.close_stats(symbol, p, "ТЕЙК-ПОЛНЫЙ", p["tp_levels"][-1])
                     del self.positions[symbol]
 
-
+def validate_tg_config():
+    return bool(cfg["token"]) and bool(cfg["chat"]) and cfg["chat"].isdigit()
+  
 def tg_send(cfg, text):
-    if not cfg.get("token") or not cfg.get("chat"):
+    if not validate_tg_config():
         return
     try:
         requests.post(
@@ -1634,19 +1635,36 @@ def main(page: ft.Page):
     # отступ сверху, чтобы статус-бар телефона не перекрывал интерфейс
     page.padding = 48
 
-    def picker_result(e: ft.FilePickerResultEvent):
+def picker_result(e: ft.FilePickerResultEvent):
+    try:
         if e.path:
+            # Проверяем существование и права доступа к исходному файлу
+            if not os.path.exists(LOG_FILE):
+                raise FileNotFoundError("Файл лога не существует")
+            if not os.access(LOG_FILE, os.R_OK):
+                raise PermissionError("Нет прав на чтение файла лога")
+            
+            # Читаем содержимое исходного лога
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
                     data = f.read()
-            except Exception:
-                data = "файл sfp_log.txt не найден"
+            except Exception as read_ex:
+                add_log(f"Ошибка чтения исходного лога: {str(read_ex)}")
+                return
+            
+            # Проверяем права на запись в целевой файл
+            if not os.access(os.path.dirname(e.path), os.W_OK):
+                raise PermissionError("Нет прав на запись в целевой файл")
+            
+            # Записываем данные в новый файл
             try:
                 with open(e.path, "w", encoding="utf-8") as f:
                     f.write(data)
-                add_log(f"Лог сохранён: {e.path}")
-            except Exception as ex:
-                add_log(f"Не удалось сохранить лог: {ex}")
+                add_log(f"Лог успешно сохранён в {e.path}")
+            except Exception as write_ex:
+                add_log(f"Ошибка при сохранении лога: {str(write_ex)}")
+    except Exception as ex:
+        add_log(f"Критическая ошибка при работе с файлами: {str(ex)}")
 
     picker = ft.FilePicker(on_result=picker_result)
     page.overlay.append(picker)
@@ -1730,10 +1748,10 @@ def main(page: ft.Page):
 
     def add_log(msg):
         with ui_lock:
-            log_view.controls.append(
-                ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
+            log_view.controls.append(ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
             page.update()
-        tg_send(cfg, msg)
+            if validate_tg_config():
+                tg_send(cfg, msg)
 
     def on_clear_log(e):
         with ui_lock:
@@ -1777,19 +1795,37 @@ def main(page: ft.Page):
             (sorted(profiles)[0] if profiles else None)
         page.update()
 
+    def validate_profile():
+        errors = []
+        if not ex.value:
+            errors.append("Не выбрана биржа")
+        if not api_key.value.strip():
+            errors.append("Пустой API-ключ")
+        if not secret.value.strip():
+            errors.append("Пустой секрет")
+        if not symbols.value.strip():
+            errors.append("Нет торговых пар")
+        try:
+            float(deposit.value)
+        except ValueError:
+            errors.append("Некорректный риск на сделку")
+        return errors
+  
     def on_save(e):
         name = profile_name.value.strip() or profile_dd.value
         if not name:
             add_log("Введите имя профиля")
             return
-        profiles[name] = collect()
-        save_profiles(profiles)
-        d = state_load()
-        d["last_profile"] = name
-        state_save(d)
-        refresh_dd(name)
-        profile_name.value = ""
-        add_log(f"Профиль «{name}» сохранён")
+    
+        errors = validate_profile()
+        if not errors:
+            profiles[name] = collect()
+            save_profiles(profiles)
+            refresh_dd(name)
+            profile_name.value = ""
+            add_log(f"Профиль «{name}» сохранён")
+        else:
+            add_log(f"Ошибки валидации: {', '.join(errors)}")
 
     def on_load(e):
         name = profile_dd.value
@@ -1823,63 +1859,95 @@ def main(page: ft.Page):
             page.update()
 
     def on_start(e):
-        if state["active"]:
-            add_log("Бот уже работает — сначала нажмите Остановить")
-            return
-        pairs = [s.strip().replace("-", "").replace("/", "").upper()
-                 for s in symbols.value.split(",") if s.strip()]
-        if not pairs:
-            add_log("Укажите хотя бы одну пару")
-            return
-        if not api_key.value.strip() or not secret.value.strip():
-            add_log("Введите API-ключ и секрет")
-            return
-        tf_cfg = TIMEFRAMES.get(tf.value)
-        if not tf_cfg:
-            add_log("Выберите таймфрейм из списка")
-            return
-        # тренд-ТФ должен быть строго крупнее рабочего ТФ
-        if trend_tf.value != EMA_OFF:
-            if trend_tf.value not in TIMEFRAMES:
-                add_log("Выберите тренд-ТФ из списка")
-                return
-            if TF_ORDER.index(trend_tf.value) <= TF_ORDER.index(tf.value):
-                add_log(f"Тренд-ТФ должен быть крупнее рабочего ТФ "
-                        f"(рабочий: {tf.value})")
-                return
         try:
-            prox = float(ema_prox.value)
-        except ValueError:
-            add_log("Проверьте число в поле «Вход не дальше N% от EMA»")
-            return
-        try:
-            risk = float(deposit.value)
-            if not (0 < risk <= 0.05):
-                raise ValueError
-        except ValueError:
-            add_log("Риск на сделку — доля баланса от 0 до 0.05 (например 0.015)")
-            return
-        demo = mode.value == "Демо"
-        if ex.value == "Bybit":
-            api = BybitAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bybit"])
-        else:
-            api = BingXAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bingx"])
-        bot = Bot(api, tf.value, trend_tf.value, pairs,
-                  risk,
-                  int(losses.value), int(maxpos.value), add_log,
-                  ema_proximity_pct=prox,
-                  load_state=load_state, save_state=save_state)
-        cfg["token"] = tg_token.value.strip()
-        cfg["chat"] = tg_chat.value.strip()
-        state["bot"] = bot
-        state["active"] = True
-        state["thread"] = threading.Thread(target=bot.run, daemon=True)
-        state["thread"].start()
-        add_log(WARNING_ISOLATED)
-        status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
-        set_buttons(True)
+            if state["active"]:
+                add_log("Бот уже работает — сначала нажмите Остановить")
+                return
+            
+            # Валидация пар
+            pairs = [s.strip().replace("-", "").replace("/", "").upper()
+                     for s in symbols.value.split(",") if s.strip()]
+            if not pairs:
+                add_log("Укажите хотя бы одну пару")
+                return
+            
+            # Проверка API-данных
+            if not api_key.value.strip() or not secret.value.strip():
+                add_log("Введите API-ключ и секрет")
+                return
+            
+            # Валидация таймфрейма
+            tf_cfg = TIMEFRAMES.get(tf.value)
+            if not tf_cfg:
+                add_log("Выберите таймфрейм из списка")
+                return
+            
+            # Валидация тренд-ТФ
+            if trend_tf.value != EMA_OFF:
+                if trend_tf.value not in TIMEFRAMES:
+                    add_log("Выберите тренд-ТФ из списка")
+                    return
+                if TF_ORDER.index(trend_tf.value) <= TF_ORDER.index(tf.value):
+                    add_log(f"Тренд-ТФ должен быть крупнее рабочего ТФ "
+                            f"(рабочий: {tf.value})")
+                    return
+            
+            # Валидация EMA proximity
+            try:
+                prox = float(ema_prox.value)
+            except ValueError:
+                add_log("Проверьте число в поле «Вход не дальше N% от EMA»")
+                return
+            
+            # Валидация риска
+            try:
+                risk = float(deposit.value)
+                if not (0 < risk <= 0.05):
+                    raise ValueError
+            except ValueError:
+                add_log("Риск на сделку — доля баланса от 0 до 0.05 (например 0.015)")
+                return
+            
+            # Создание API-клиента
+            demo = mode.value == "Демо"
+            try:
+                if ex.value == "Bybit":
+                    api = BybitAPI(api_key.value.strip(), secret.value.strip(),
+                                  demo, tf_cfg["interval_bybit"])
+                else:
+                    api = BingXAPI(api_key.value.strip(), secret.value.strip(),
+                                  demo, tf_cfg["interval_bingx"])
+            except Exception as ex:
+                add_log(f"Ошибка создания API-клиента: {str(ex)}")
+                return
+            
+            # Инициализация бота
+            try:
+                bot = Bot(api, tf.value, trend_tf.value, pairs,
+                         risk,
+                         int(losses.value), int(maxpos.value), add_log,
+                         ema_proximity_pct=prox,
+                         load_state=load_state, save_state=save_state)
+            except Exception as ex:
+                add_log(f"Ошибка инициализации бота: {str(ex)}")
+                return
+            
+            # Настройка Telegram
+            cfg["token"] = tg_token.value.strip()
+            cfg["chat"] = tg_chat.value.strip()
+            
+            # Запуск бота
+            state["bot"] = bot
+            state["active"] = True
+            state["thread"] = threading.Thread(target=bot.run, daemon=True)
+            state["thread"].start()
+            
+            add_log(WARNING_ISOLATED)
+            status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
+            set_buttons(True)
+            
+        except Exception as ex:
+            add_log(f"Критическая ошибка при запуске бота: {str(ex)}")
 
     def on_stop(e):
         if state["bot"]:
