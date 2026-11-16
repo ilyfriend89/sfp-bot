@@ -40,7 +40,7 @@ TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 LOG_MAX = 200_000
 
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
-DRY_RUN = True          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
+DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
 DRY_RUN_BALANCE = 1000.0
 
 # ------------------- ТАЙМФРЕЙМЫ (множители объёма SFP как в v4) -------------------
