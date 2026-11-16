@@ -880,45 +880,77 @@ class Bot:
                 self.log(f"{symbol}: снят оставшийся ордер {oid}")
 
     def cancel_entry_confirmed(self, symbol, p):
-        """Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых
-        ордеров, что на бирже входных не осталось. False = есть сомнения —
-        слот не освобождается, отмена повторится в следующем цикле.
-        'Ордер не найден' в ответе биржи считается успехом (уже снят)."""
+        """
+        Снимает входной лимит-ордер и ПОДТВЕРЖДАЕТ через список открытых ордеров.
+        Возвращает True, если считаем, что входных ордеров на бирже больше нет.
+        Возвращает False, если есть сомнения (ордера висят или список не получен).
+        """
         api = self.api
         oid = p.get("order_id")
-        if not oid and not DRY_RUN:
-            self.log(f"{symbol}: ВНИМАНИЕ — orderId не сохранён, отменяю "
-                     f"по списку открытых ордеров")
+        
+        # 1. Попытка прямой отмены по ID
         if oid:
-            if not api.cancel(symbol, oid):
-                err = str(getattr(api, "last_error", "") or "").lower()
-                if ("not found" in err or "not exist" in err or
-                        "не существ" in err):
-                    self.log(f"{symbol}: ордер {oid} на бирже уже отсутствует")
-                else:
-                    self.log(f"{symbol}: отмена ордера {oid} не прошла "
-                             f"({getattr(api, 'last_error', 'нет данных')}) — "
-                             f"перепроверяю через список ордеров")
-        remaining = api.open_entry_orders(symbol)
-        if remaining is None:
-            self.log(f"{symbol}: НЕ УДАЛОСЬ ПРОВЕРИТЬ ВХОДНЫЕ ОРДЕРА — "
-                     f"проверьте листики на бирже вручную!")
-            return False
-        ok = True
-        for r in remaining:
-            if api.cancel(symbol, r):
-                self.log(f"{symbol}: снят входной ордер {r}")
+            if api.cancel(symbol, oid):
+                self.log(f"{symbol}: ордер {oid} успешно отменен по ID")
+                # Если отмена прошла успешно, считаем, что все чисто. 
+                # Но для надежности все равно проверим список ниже.
             else:
-                err = str(getattr(api, "last_error", "") or "").lower()
-                if ("not found" in err or "not exist" in err or
-                        "не существ" in err):
-                    self.log(f"{symbol}: ордер {r} на бирже уже отсутствует")
+                err_msg = str(getattr(api, "last_error", "")).lower()
+                # Если биржа говорит "не найден" или "не существует" - это успех!
+                if "not found" in err_msg or "not exist" in err_msg or "не существ" in err_msg:
+                    self.log(f"{symbol}: ордер {oid} уже отсутствовал на бирже (OK)")
                 else:
-                    self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r} "
-                             f"({getattr(api, 'last_error', 'нет данных')}) — "
-                             f"ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
-                    ok = False
-        return ok
+                    self.log(f"{symbol}: отмена ордера {oid} не прошла ({err_msg}). Перепроверка списка ордеров...")
+
+        # 2. Перепроверка через список открытых ордеров
+        try:
+            remaining_ids = api.open_entry_orders(symbol)
+        except Exception as ex:
+            self.log(f"{symbol}: КРИТИЧЕСКАЯ ОШИБКА при получении списка ордеров: {ex}. Слот не освобождаем!")
+            return False
+
+        # Если API вернул None, значит, мы не можем проверить состояние. 
+        # В этом случае безопаснее НЕ освобождать слот, чтобы не наплодить позиций.
+        if remaining_ids is None:
+            self.log(f"{symbol}: НЕ УДАЛОСЬ ПОЛУЧИТЬ СПИСОК ОРДЕРОВ. Проверьте биржу вручную!")
+            return False
+
+        # Фильтруем: оставляем только те ID, которые реально являются входными лимитами
+        # и которые НЕ совпадают с тем, который мы только что пытались снять (на случай рассинхрона)
+        active_entry_ids = [r for r in remaining_ids if r != oid]
+
+        if not active_entry_ids:
+            self.log(f"{symbol}: Проверка списка ордеров: активных входных ордеров не найдено. Слот свободен.")
+            return True
+
+        # 3. Если в списке остались ордера, пытаемся снять их принудительно
+        self.log(f"{symbol}: Обнаружены активные входные ордера: {active_entry_ids}. Попытка массовой отмены...")
+        all_removed = True
+        
+        for r_id in active_entry_ids:
+            if api.cancel(symbol, r_id):
+                self.log(f"{symbol}: снят входной ордер {r_id}")
+            else:
+                err_msg = str(getattr(api, "last_error", "")).lower()
+                if "not found" in err_msg or "not exist" in err_msg or "не существ" in err_msg:
+                    self.log(f"{symbol}: ордер {r_id} уже отсутствовал (OK)")
+                else:
+                    self.log(f"{symbol}: НЕ СМОГ СНЯТЬ ОРДЕР {r_id} ({err_msg}) — ПРОВЕРЬТЕ НА БИРЖЕ ВРУЧНУЮ!")
+                    all_removed = False
+        
+        # Если после всех попыток что-то осталось, возвращаем False, чтобы слот не освобождался
+        if not all_removed:
+            return False
+            
+        # Финальная проверка: если мы сняли все, что нашли, пробуем еще раз получить список
+        # (защита от гонки данных)
+        final_check = api.open_entry_orders(symbol)
+        if final_check and len(final_check) > 0:
+            self.log(f"{symbol}: ВНИМАНИЕ: после массовой отмены в списке еще есть ордера: {final_check}. Слот НЕ освобождаем.")
+            return False
+
+        self.log(f"{symbol}: Все входные ордера успешно сняты или отсутствовали. Слот освобожден.")
+        return True
   
     def place_stop(self, symbol, p, qty, stop_price):
         if DRY_RUN:
