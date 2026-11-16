@@ -1691,6 +1691,23 @@ def main(page: ft.Page):
             log_view.controls.clear()
             page.update()
 
+    def picker_result(e: ft.FilePickerResultEvent):
+        if e.path:
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    data = f.read()
+            except Exception:
+                data = "файл sfp_log.txt не найден"
+            try:
+                with open(e.path, "w", encoding="utf-8") as f:
+                    f.write(data)
+                add_log(f"Лог сохранён: {e.path}")
+            except Exception as ex:
+                add_log(f"Не удалось сохранить лог: {ex}")
+
+    picker = ft.FilePicker(on_result=picker_result)
+    page.overlay.append(picker)  
+  
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
               "api_key": api_key, "secret": secret, "symbols": symbols,
               "deposit": deposit, "losses": losses, "maxpos": maxpos,
@@ -1850,7 +1867,12 @@ def main(page: ft.Page):
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
 
     log_tab = ft.Column([
-        ft.Row([ft.OutlinedButton("Очистить журнал", on_click=on_clear_log)]),
+        ft.Row([
+            ft.OutlinedButton("Очистить журнал", on_click=on_clear_log),
+            ft.FilledButton("Сохранить лог",
+                            on_click=lambda e: picker.save_file(
+                                file_name="sfp_log.txt")),
+        ]),
         log_view,
     ], spacing=10, expand=True)
 
