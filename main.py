@@ -61,43 +61,32 @@ def _pick_log_dir():
 LOG_DIR = _pick_log_dir()
 LOG_FILE = os.path.join(LOG_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(LOG_DIR, "sfp_trades.csv")
-# Запасные копии — всегда в системной папке приложения, она доступна безусловно
-LOG_FALLBACK_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
-TRADES_FALLBACK_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
-LOG_MAX = 200_000
+SYS_LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
+SYS_TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 
-# Ошибки записи журнала НЕ глотаются: собираются и показываются при старте
-_LOG_ERRORS = []
-_LOG_PRIM_OK = False
 
-def _create_log_files():
-    """Файлы журнала и сделок создаются при старте процесса, а не первой записью."""
-    global _LOG_PRIM_OK
-    try:
-        if not os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.write("")
-        _LOG_PRIM_OK = True
-    except Exception as e:
-        _LOG_ERRORS.append(f"{LOG_FILE}: {type(e).__name__}: {e}")
-    for path in (LOG_FALLBACK_FILE, TRADES_FILE, TRADES_FALLBACK_FILE):
+def _init_log_files():
+    """Файлы создаются при загрузке модуля, а не первой записью:
+    кнопки 'Лог'/'Сделки' никогда не встречают пустоту."""
+    for path in (LOG_FILE, TRADES_FILE):
         try:
             if not os.path.exists(path):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("")
-        except Exception as e:
-            _LOG_ERRORS.append(f"{path}: {type(e).__name__}: {e}")
+                with open(path, "w", encoding="utf-8"):
+                    pass
+        except Exception:
+            pass
+    try:  # пробная запись — сбой виден сразу, а не молча
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | === файл создан при старте: {LOG_FILE} ===\n")
+    except Exception:
+        pass
 
-_create_log_files()
 
-if _LOG_PRIM_OK:
-    LOG_PATH_NOTE = f"Журнал: {LOG_FILE} (создан при старте)"
-elif os.path.exists(LOG_FALLBACK_FILE):
-    LOG_PATH_NOTE = (f"Журнал: {LOG_FALLBACK_FILE} — общая папка не приняла файл "
-                     f"({_LOG_ERRORS[0] if _LOG_ERRORS else 'запись отклонена'})")
-else:
-    LOG_PATH_NOTE = ("Журнал: ЗАПИСЬ НЕВОЗМОЖНА НИКУДА — " +
-                     ("; ".join(_LOG_ERRORS) or "нет прав на запись"))
+_init_log_files()
+LOG_PATH_NOTE = (f"Журнал: {LOG_DIR}" if LOG_DIR != _DATA_DIR else
+                 f"Журнал: {_DATA_DIR} — общие папки недоступны "
+                 f"(нет разрешения на запись)")
+LOG_MAX = 200_000
 
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
 DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
@@ -157,7 +146,7 @@ RANGE_MIN_TP2_R = 2.5          # дальняя граница ближе -> п�
 RANGE_TARGET_FRAC = 0.90       # фронт-ранним дальнюю границу на 10%
 RANGE_MIN_WIDTH_R = 3.5        # ширина канала >= 3.5 x стоп
 RANGE_STOP_ATR = 0.6
-RANGE_ENTRY_RETRACE = 0.38     # вход на 38% отката сигнальной свечи
+RANGE_ENTRY_RETRACE = 0.25     # вход на 25% отката сигнальной свечи (вариант 1)
 RANGE_DAYS = 3
 RANGE_TOUCH_TOL = 0.0015
 RANGE_VOL_MULT = 1.3           # ТЕПЕРЬ РЕАЛЬНО ПРИМЕНЯЕТСЯ
@@ -169,6 +158,10 @@ CHOCH_SWING = 60               # TREND-B: мажорный свинг
 CHOCH_MINOR = 10               # минорный свинг для слома структуры
 CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70      # размер против режима
+
+# --- ВАРИАНТ 1: РАННИЙ ВХОД (сдвиг лимита к рынку) ---
+TREND_A_ENTRY_OFF = 0.30       # вход на 0.3 ATR ближе к рынку от уровня свинга
+TREND_B_ENTRY_OFF = 0.20       # вход на 0.2 ATR ближе от сломанного минорного уровня
 
 # ------------------- РИСК / ЛИМИТЫ -------------------
 RISK_PCT_DEFAULT = 0.010       # 1% на период валидации (в поле можно 0.015)
@@ -218,36 +211,24 @@ def cluster_of(symbol):
 
 
 # ------------------- УТИЛИТЫ -------------------
-def _log_write(path, text):
-    if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
-        with open(path, "r", encoding="utf-8") as f:
-            data = f.read()
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(data[-LOG_MAX // 2:])
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
-
 def log_to_file(text):
+    line = f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n"
     try:
-        _log_write(LOG_FILE, text)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(data[-LOG_MAX // 2:])
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
         return
-    except Exception as e:
-        msg = (f"основной журнал недоступен ({type(e).__name__}: {e}) — "
-               f"пишу в {LOG_FALLBACK_FILE}")
-        if msg not in _LOG_ERRORS:
-            _LOG_ERRORS.append(msg)
-    try:
-        _log_write(LOG_FALLBACK_FILE, text)
-        return
-    except Exception as e:
-        msg2 = f"журнал не записан нигде ({type(e).__name__}: {e})"
-        if msg2 not in _LOG_ERRORS:
-            _LOG_ERRORS.append(msg2)
-
-
-log_to_file(f"=== файл журнала создан при старте: {LOG_FILE} ===")
-if _LOG_ERRORS:
-    LOG_PATH_NOTE += " | ВНИМАНИЕ: " + _LOG_ERRORS[0]
+    except Exception:
+        pass
+    try:  # основная папка отвалилась — ничего не теряем
+        with open(SYS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 def dbg(text):
@@ -1375,7 +1356,12 @@ class Signals:
         if not (long_ok or short_ok):
             return None
         side = "LONG" if long_ok else "SHORT"
-        entry = sw_lo if side == "LONG" else sw_hi
+        off = TREND_A_ENTRY_OFF * atr
+        entry = sw_lo + off if side == "LONG" else sw_hi - off
+        # защита: сдвинутая цена за рынком -> откат к классическому уровню
+        if (side == "LONG" and entry >= last[4]) or \
+           (side == "SHORT" and entry <= last[4]):
+            entry = sw_lo if side == "LONG" else sw_hi
         beyond = min(last[3], sw_lo) if side == "LONG" else max(last[2], sw_hi)
         dist = self._stop_dist(entry, atr, SFP_STOP_ATR, ctx["spread"])
         stop = beyond - dist if side == "LONG" else beyond + dist
@@ -1423,7 +1409,12 @@ class Signals:
             (ef[-1] > es[-1] and slope >= 0)
         if not conf:
             return None
-        entry = mn_lo if side == "SHORT" else mn_hi   # ретест сломанного уровня
+        off = TREND_B_ENTRY_OFF * atr
+        entry = mn_lo - off if side == "SHORT" else mn_hi + off
+        # защита: сдвинутая цена за рынком -> откат к классическому уровню
+        if (side == "SHORT" and entry >= last[4]) or \
+           (side == "LONG" and entry <= last[4]):
+            entry = mn_lo if side == "SHORT" else mn_hi
         beyond = last[2] if side == "SHORT" else last[3]
         dist = self._stop_dist(entry, atr, CHOCH_STOP_ATR, ctx["spread"])
         stop = beyond + dist if side == "SHORT" else beyond - dist
@@ -1695,12 +1686,8 @@ class Bot:
 
     def _csv_trade(self, symbol, p, category, cur, r_gross, r_net, usdt, fees):
         try:
-            try:
-                f = open(TRADES_FILE, "a", newline="", encoding="utf-8")
-            except Exception:
-                f = open(TRADES_FALLBACK_FILE, "a", newline="", encoding="utf-8")
-            new = f.tell() == 0
-            with f:
+            new = not os.path.exists(TRADES_FILE)
+            with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if new:
                     w.writerow(["ts", "symbol", "kind", "side", "entry", "stop0",
@@ -1723,7 +1710,26 @@ class Bot:
                             f"{ft_.get('room', 0):.3f}", f"{ft_.get('align', 0):.3f}",
                             f"{ft_.get('cost', 0):.3f}"])
         except Exception as ex:
-            dbg(f"CSV trade write fail: {ex}")
+            try:  # основная папка недоступна — сделка не должна потеряться
+                with open(SYS_TRADES_FILE, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    ft_ = p.get("feats") or {}
+                    w.writerow([dt.datetime.now().isoformat(timespec="seconds"),
+                                symbol, p.get("kind"), p["side"], qstr(p["entry"]),
+                                qstr(p.get("stop0") or 0), qstr(p["risk"]),
+                                qstr(p.get("qty_total") or 0), qstr(p["tp_levels"][0]),
+                                qstr(p["tp_levels"][-1]), sum(p["tp_filled"]),
+                                qstr(cur) if cur is not None else "", category,
+                                f"{r_gross:.4f}", f"{r_net:.4f}", f"{usdt:.4f}",
+                                f"{fees:.4f}", f"{p.get('mae', 0):.3f}",
+                                f"{p.get('mfe', 0):.3f}", f"{p.get('score', 0):.3f}",
+                                int(bool(p.get("confluence"))),
+                                f"{ft_.get('vol_z', 0):.3f}", f"{ft_.get('depth', 0):.3f}",
+                                f"{ft_.get('room', 0):.3f}", f"{ft_.get('align', 0):.3f}",
+                                f"{ft_.get('cost', 0):.3f}"])
+                dbg(f"CSV: строка записана в системную копию ({ex})")
+            except Exception:
+                dbg(f"CSV trade write fail: {ex}")
 
     # ---------- отбор сигналов ----------
     def _bar_t(self, symbol):
@@ -2220,13 +2226,14 @@ class Bot:
                 if info:
                     self.cancel_leftover_entry(symbol, p)
                     self._activate(symbol, p, info)
-                elif (not DRY_RUN
-                      and time.time() - p.get("_gone_chk", 0) >= 30
-                      and self._entry_gone(symbol)):
+                elif not DRY_RUN and time.time() - p.get("_gone_chk", 0) >= 30:
+                    # метка ставится до проверки: лимит не более раза в 30с,
+                    # даже если _entry_gone вернула False (ордер жив или сбой API)
                     p["_gone_chk"] = time.time()
-                    self.log(f"{symbol}: входной ордер исчез с биржи "
-                             f"(снят вручную?) — слот освобождён")
-                    del self.positions[symbol]
+                    if self._entry_gone(symbol):
+                        self.log(f"{symbol}: входной ордер исчез с биржи "
+                                 f"(снят вручную?) — слот освобождён")
+                        del self.positions[symbol]
                 elif time.time() > p["placed_ts"] + ENTRY_WAIT * self.tf_sec:
                     if self.cancel_entry_confirmed(symbol, p):
                         self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
@@ -2430,6 +2437,8 @@ class Bot:
                  f"{'вкл' if PREEMPT_ENABLED else 'выкл'} (порог x{PREEMPT_SCORE_RATIO}). "
                  f"Позиции каждые {FAST_PERIOD}с, сигналы на закрытии бара")
         self.log(MOSCOW_HINT)
+        self.log(f"Вариант 1 (ранний вход): TREND-A +{TREND_A_ENTRY_OFF} ATR, "
+                 f"TREND-B +{TREND_B_ENTRY_OFF} ATR, RANGE откат {RANGE_ENTRY_RETRACE:.2f}")
         self.log(LOG_PATH_NOTE)
         if DRY_RUN:
             self.equity = self.dry_balance
@@ -2561,18 +2570,9 @@ def main(page: ft.Page):
     btn_start = ft.FilledButton("Запустить", expand=True)
     btn_stop = ft.FilledButton("Остановить", expand=True, disabled=True)
 
-    _err_seen = [0]
-
     def add_log(msg, to_file=True):
         if to_file:
             log_to_file(msg)
-        if len(_LOG_ERRORS) > _err_seen[0]:
-            _err_seen[0] = len(_LOG_ERRORS)
-            with ui_lock:
-                log_view.controls.append(ft.Text(
-                    f"{dt.datetime.now():%H:%M:%S}  ⚠ ЖУРНАЛ: {_LOG_ERRORS[-1]}",
-                    color=ft.Colors.ORANGE))
-                page.update()
         with ui_lock:
             log_view.controls.append(ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
             page.update()
@@ -2582,24 +2582,26 @@ def main(page: ft.Page):
         add_log(msg, to_file=False)   # бот уже записал в файл
 
     def _export(src, name):
+        sys_src = SYS_LOG_FILE if "log" in name else SYS_TRADES_FILE
         data = None
-        for path in (src, os.path.join(_DATA_DIR, name)):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                data = f.read()
+        except Exception:
+            pass
+        if data is None:
+            try:  # основной файл недоступен — берём системную копию
+                with open(sys_src, "r", encoding="utf-8") as f:
                     data = f.read()
-                break
+                add_log(f"{name}: взята системная копия {sys_src}")
             except Exception:
-                continue
+                pass
         if data is None:
             add_log(f"{name}: файл ещё не создан — запустите бота и повторите "
-                    f"(искал: {src} и {os.path.join(_DATA_DIR, name)})")
+                    f"(искал: {src} и {sys_src})")
             return
-        if data == "":
-            what = ("бот ещё не начал писать" if name.endswith(".txt")
-                    else "закрытых сделок пока нет")
-            extra = (f"; ошибки записи: {'; '.join(_LOG_ERRORS)}"
-                     if _LOG_ERRORS and name.endswith(".txt") else "")
-            add_log(f"{name}: файл создан при старте, но пуст — {what}{extra}")
+        if not data.strip():
+            add_log(f"{name}: файл создан при старте, но пуст — бот ещё не начал писать")
             return
         for base in ("/storage/emulated/0/Documents", "/sdcard/Documents",
                      "/storage/emulated/0/Download", "/sdcard/Download",
