@@ -761,6 +761,7 @@ class BingXAPI:
                     url = f"{self.base}{path}?{urllib.parse.urlencode(sorted(params.items()))}"
                     headers = {}
                 r = requests.post(url, headers=headers, timeout=15) if method == "POST" \
+                    else requests.delete(url, headers=headers, timeout=15) if method == "DELETE" \
                     else requests.get(url, headers=headers, timeout=15)
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as ex:
@@ -1036,7 +1037,7 @@ class BingXAPI:
             self.last_error = "нет orderId/clientOrderId"
             return False
         try:
-            res = self.req("POST", "/openApi/swap/v2/trade/cancelOrder", p)
+            res = self.req("DELETE", "/openApi/swap/v2/trade/order", p)
             dbg(f"BingX cancel {symbol} {p} -> {res}")
             self.last_error = None
             return True
@@ -1047,7 +1048,7 @@ class BingXAPI:
 
     def cancel_all(self, symbol):
         try:
-            res = self.req("POST", "/openApi/swap/v2/trade/cancelAllOpenOrders",
+            res = self.req("DELETE", "/openApi/swap/v2/trade/allOpenOrders",
                            {"symbol": self.fmt(symbol)})
             dbg(f"BingX cancel-all {symbol} -> {res}")
             return True
@@ -1065,7 +1066,7 @@ class BingXAPI:
             p["clientOrderId"] = str(client_id)
         if stop:
             p["type"] = "TRIGGER_MARKET"
-            p["triggerPrice"] = qstr(stop)
+            p["stopPrice"] = qstr(stop)
             p["workingType"] = "MARK_PRICE"
         elif tp:
             p["type"] = "LIMIT"
@@ -1412,6 +1413,7 @@ class Bot:
         self.stop_event = threading.Event()
         self.sig = Signals(api, tf_label, trend_label, ema_proximity_pct, self.log)
         self.positions = {}
+        self._orphans = {}   # символ: (oid, cid, попытки) — висящие ордера
         self.equity = DRY_RUN_BALANCE
         self.dry_balance = DRY_RUN_BALANCE
         self.day = dt.date.today()
@@ -1713,9 +1715,10 @@ class Bot:
     # ==================================================================
     def _err_kind(self, err):
         e = str(err or "").lower()
-        if any(k in e for k in ("not exist", "not found", "does not exist", "no such",
+        if any(k in e for k in ("order not exist", "orderid not exist", "order_not_exist",
+                                "does not exist", "order not found", "no such",
                                 "already", "cancelled", "canceled", "filled",
-                                "110007", "order_not_exists", "не существ")):
+                                "110007", "не существует ордер")):
             return "gone"
         if any(k in e for k in RATE_HINTS):
             return "retry"
@@ -1734,6 +1737,23 @@ class Bot:
             return self.api.open_entry_orders(symbol)
         except Exception:
             return None
+
+    def orphan_sweep(self):
+        """Повтор отмены висящих входных лимитов до подтверждения снятия."""
+        if DRY_RUN or not self._orphans:
+            return
+        for sym in list(self._orphans):
+            oid, cid, n = self._orphans[sym]
+            kind = self._do_cancel(sym, oid=oid or None,
+                                   cid=None if oid else (cid or None))
+            if kind == "gone":
+                del self._orphans[sym]
+                self.log(f"{sym}: висящий входной ордер снят ({oid or cid})")
+                continue
+            self._orphans[sym] = (oid, cid, n + 1)
+            if n + 1 in (5, 15, 30):
+                self.log(f"{sym}: ⚠️ висящий входной ордер {oid or cid} не снят "
+                         f"({kind}) — снимите вручную!")
 
     def _cancel_pending(self, symbol, p, why):
         p["cancel_fails"] = p.get("cancel_fails", 0) + 1
@@ -1835,6 +1855,21 @@ class Bot:
         s = sig["symbol"]
         if s in self.positions:
             return False
+        if not DRY_RUN:
+            live = self.api.open_positions()
+            if live and s in live:
+                self.log(f"{s}: на бирже позиция вне бота — перезапустите бот "
+                         f"для подхвата, вход отменён (no-dup)")
+                return False
+            left = self._entry_left(s)
+            if left:
+                for oid, cid in left:
+                    self._do_cancel(s, oid=oid or None,
+                                    cid=None if oid else (cid or None))
+                    self._orphans[s] = (oid, cid, 0)
+                self.log(f"{s}: на бирже висят входные лимиты ({len(left)}) — "
+                         f"снятие, вход отложен (no-dup)")
+                return False
         entry, risk = sig["entry"], sig["risk"]
         mult = sig["size_mult"]
         if sig.get("confluence"):
@@ -1846,6 +1881,14 @@ class Bot:
         if qty <= 0:
             self.log(f"{s}: объём {raw_qty:.6f} ниже минимума биржи — пропуск")
             return False
+        q = self.api.quote(s) or {}
+        now_px = _f(q.get("last"))
+        if now_px > 0:
+            if (sig["side"] == "SHORT" and now_px >= entry) or \
+               (sig["side"] == "LONG" and now_px <= entry):
+                self.log(f"{s}: цена уже за входом ({qstr(now_px)} против входа "
+                         f"{qstr(entry)}) — сигнал пропущен (no-chase)")
+                return False
         cid = new_client_id("sfp")
         oid = None
         if not DRY_RUN:
@@ -1973,9 +2016,11 @@ class Bot:
         sid, scid = self.place_stop(symbol, p, qty, p["stop_price"])
         p["stop_id"], p["stop_cid"] = sid, scid
         self.place_tps(symbol, p)
+        ok = bool(sid) or bool(scid)
         self.log(f"ВХОД исполнен {p['side']} {symbol} [{p['kind']}] по "
                  f"{qstr(info.get('entry') or p['entry'])}, стоп "
-                 f"{qstr(p['stop_price'])}, защита выставлена")
+                 f"{qstr(p['stop_price'])}, "
+                 f"{'защита выставлена' if ok else 'СТОП НЕ ВЫСТАВЛЕН — резервное закрытие'}")
 
     def _detect_tps(self, symbol, p, info):
         if p["qty_total"] <= 0:
@@ -2173,7 +2218,12 @@ class Bot:
             stop, _ = self.api.pending_exit_prices(sym)
             self.cleanup_orders(sym)
             for oid, cid in (self.api.open_entry_orders(sym) or []):
-                self._do_cancel(sym, oid=oid or None, cid=None if oid else (cid or None))
+                kind = self._do_cancel(sym, oid=oid or None,
+                                       cid=None if oid else (cid or None))
+                if kind != "gone":
+                    self._orphans[sym] = (oid, cid, 0)
+                    self.log(f"{sym}: ⚠️ входной ордер при подхвате не снят "
+                             f"({kind}) — повторю в цикле")
             if not stop or stop == entry:
                 stop = entry * (1 - 0.01) if side == "LONG" else entry * (1 + 0.01)
                 self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
@@ -2210,9 +2260,14 @@ class Bot:
             except Exception:
                 left = None
             for oid, cid in (left or []):
-                if self._do_cancel(sym, oid=oid or None,
-                                   cid=None if oid else (cid or None)) == "gone":
+                kind = self._do_cancel(sym, oid=oid or None,
+                                       cid=None if oid else (cid or None))
+                if kind == "gone":
                     self.log(f"{sym}: снят осиротевший входной ордер {oid or cid}")
+                else:
+                    self._orphans[sym] = (oid, cid, 0)
+                    self.log(f"{sym}: ⚠️ осиротевший входной ордер {oid or cid} "
+                             f"не снят ({kind}) — повторю в цикле")
         if self.positions:
             self.log(f"Восстановлено позиций: {len(self.positions)}")
 
@@ -2271,6 +2326,10 @@ class Bot:
                 self.manage_positions()
             except Exception as ex:
                 self.log(f"Ошибка сопровождения: {ex}\n{traceback.format_exc()}")
+            try:
+                self.orphan_sweep()
+            except Exception as ex:
+                self.log(f"Ошибка sweep: {ex}\n{traceback.format_exc()}")
             now_ms = int(time.time() * 1000)
             bar_id, into = now_ms // bar_ms, now_ms % bar_ms
             if bar_id != last_bar and into >= 5000:
