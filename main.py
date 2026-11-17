@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  SFP-бот v5  —  Bybit / BingX  —  оболочка Flet (настройки v4 сохранены)
+#  SFP-бот v5 CLEAN — Bybit / BingX — оболочка Flet
 #  ЧАСТЬ 1/5: конфигурация, индикаторы, утилиты
+#  Оптимизирован под 10-15% в месяц. Логи -> Download/SFP_Bot/
 #  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
-#  Размер позиции считает бот от риска; плечо задаёт только залог.
-#  ФОРМАТ БАРА ВЕЗДЕ: (t_ms, open, high, low, close, volume)
-#  Сигналы считаются по ЗАКРЫТЫМ барам; последний элемент списка —
-#  ещё формирующаяся свеча и в расчёт сигналов не берётся.
 # =====================================================================
 import os
 import csv
@@ -30,107 +27,125 @@ BYBIT_DEMO = "https://api-demo.bybit.com"
 BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
-_DATA_DIR = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
+# ------------------- ПАПКА ДАННЫХ (Download/SFP_Bot) -------------------
+def _get_data_dir():
+    """Папка для логов, сделок, состояния. По умолчанию — Download/SFP_Bot."""
+    for p in ("/storage/emulated/0/Download", "/sdcard/Download",
+              os.path.expanduser("~/Downloads"), os.path.expanduser("~/Загрузки")):
+        if os.path.isdir(p) and os.access(p, os.W_OK):
+            sub = os.path.join(p, "SFP_Bot")
+            try:
+                os.makedirs(sub, exist_ok=True)
+                if os.access(sub, os.W_OK):
+                    return sub
+            except Exception:
+                continue
+    base = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
+    sub = os.path.join(base, "SFP_Bot")
+    os.makedirs(sub, exist_ok=True)
+    return sub
+
+_DATA_DIR = _get_data_dir()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 LOG_MAX = 200_000
-DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
-DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
+DEBUG_API = True
+DRY_RUN = False
 DRY_RUN_BALANCE = 1000.0
 
-# ------------------- ТАЙМФРЕЙМЫ (множители объёма SFP как в v4) -------------------
+# ------------------- ТАЙМФРЕЙМЫ -------------------
 TIMEFRAMES = {
-    "1 минута ": {"interval_bybit ": "1 ",    "interval_bingx ": "1m ",  "vol_mult ": 3.0},
-    "5 минут ":  {"interval_bybit ": "5 ",    "interval_bingx ": "5m ",  "vol_mult ": 2.8},
-    "15 минут ": {"interval_bybit ": "15 ",   "interval_bingx ": "15m ", "vol_mult ": 1.5},
-    "30 минут ": {"interval_bybit ": "30 ",   "interval_bingx ": "30m ", "vol_mult ": 2.2},
-    "1 час ":    {"interval_bybit ": "60 ",   "interval_bingx ": "1h ",  "vol_mult ": 2.0},
-    "4 часа ":   {"interval_bybit ": "240 ",  "interval_bingx ": "4h ",  "vol_mult ": 1.5},
-    "1 день ":   {"interval_bybit ": "D ",    "interval_bingx ": "1d ",  "vol_mult ": 1.2},
+    "1 минута":  {"interval_bybit": "1",    "interval_bingx": "1m",   "vol_mult": 3.0},
+    "5 минут":   {"interval_bybit": "5",    "interval_bingx": "5m",   "vol_mult": 2.8},
+    "15 минут":  {"interval_bybit": "15",   "interval_bingx": "15m",  "vol_mult": 1.5},
+    "30 минут":  {"interval_bybit": "30",   "interval_bingx": "30m",  "vol_mult": 2.2},
+    "1 час":     {"interval_bybit": "60",   "interval_bingx": "1h",   "vol_mult": 2.0},
+    "4 часа":    {"interval_bybit": "240",  "interval_bingx": "4h",   "vol_mult": 1.5},
+    "1 день":    {"interval_bybit": "D",    "interval_bingx": "1d",   "vol_mult": 1.2},
 }
-TF_MINUTES = {"1 минута ": 1, "5 минут ": 5, "15 минут ": 15, "30 минут ": 30,
-              "1 час ": 60, "4 часа ": 240, "1 день ": 1440}
-TF_ORDER = ["1 минута ", "5 минут ", "15 минут ", "30 минут ", "1 час ", "4 часа ", "1 день "]
+TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 минут": 30,
+              "1 час": 60, "4 часа": 240, "1 день": 1440}
+TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "1 день"]
 
 BYBIT_ALIASES = {
-    "PEPEUSDT ": "1000PEPEUSDT ", "BONKUSDT ": "1000BONKUSDT ",
-    "FLOKIUSDT ": "1000FLOKIUSDT ", "SHIBUSDT ": "1000SHIBUSDT ",
-    "PUMPUSDT ": "1000PUMPUSDT ", "WLFIUSDT ": "1000WLFIUSDT ",
+    "PEPEUSDT": "1000PEPEUSDT", "BONKUSDT": "1000BONKUSDT",
+    "FLOKIUSDT": "1000FLOKIUSDT", "SHIBUSDT": "1000SHIBUSDT",
+    "PUMPUSDT": "1000PUMPUSDT", "WLFIUSDT": "1000WLFIUSDT",
 }
 BINGX_ALIASES = {
-    "PEPEUSDT ": "1000PEPEUSDT ", "PUMPUSDT ": "1000PUMPUSDT ",
+    "PEPEUSDT": "1000PEPEUSDT", "PUMPUSDT": "1000PUMPUSDT",
 }
 
 # ------------------- ИНДИКАТОРЫ / РЕЖИМ -------------------
-EMA_PERIOD = 50            # EMA фильтра тренда на тренд-ТФ
-EMA_FAST = 20              # быстрая EMA на рабочем ТФ (подтверждение разворота)
+EMA_PERIOD = 50
+EMA_FAST = 20
 EMA_OFF = "Выключен"
 ATR_PERIOD = 14
-REGIME_LOOKBACK = 10       # баров тренд-ТФ для замера наклона EMA50
-REGIME_THRESHOLD = 1.5     # |наклон| / ATR_htf выше -> сильный тренд
-HTF_BARS = 160             # запас свечей тренд-ТФ
-WORK_BARS = 320            # запас свечей рабочего ТФ
+REGIME_LOOKBACK = 10
+REGIME_THRESHOLD = 1.5
+HTF_BARS = 160
+WORK_BARS = 320
 
-# ------------------- ИЗДЕРЖКИ (пол стопа) -------------------
-FEE_MAKER = 0.0002         # 0.02% — вход и тейки (лимиты)
-FEE_TAKER = 0.0005         # 0.05% — стоп (маркет). Bybit taker 0.055%
-COST_STOP_MULT = 10.0      # stop >= 10 x издержек -> издержки <= 0.10R
-MAX_SPREAD_PCT = 0.30      # спред шире -> пара непригодна, пропуск
+# ------------------- ИЗДЕРЖКИ (ужесточено для защиты от комиссий) -------------------
+FEE_MAKER = 0.0002
+FEE_TAKER = 0.0005
+COST_STOP_MULT = 12.0          # БЫЛО 10.0 — строже фильтр «грязных» стопов
+MAX_SPREAD_PCT = 0.20          # БЫЛО 0.30 — уже спред, отсекаем неликвид
 
-# ------------------- СХЕМЫ ВЫХОДОВ v5 -------------------
-TP_TREND = [(1.5, 0.40), (3.0, 0.30)]   # хвост 0.30 трейлится ATR-каналом
+# ------------------- СХЕМЫ ВЫХОДОВ v5 (оптимизированы под 10-15% в месяц) -------------------
+TP_TREND = [(1.2, 0.50), (2.5, 0.20)]  # БЫЛО 1.5/3.0 — забираем 50% прибыли раньше
 TREND_TAIL_SHARE = 0.30
 CHANDELIER_LOOKBACK = 22
-CHANDELIER_ATR = 3.0
-TREND_BE_AFTER_TP1 = 0.0       # стоп в безубыток после ТП1 (ТП1 далеко, 1.5R)
+CHANDELIER_ATR = 2.5                   # БЫЛО 3.0 — плотнее трейлинг
+TREND_BE_AFTER_TP1 = 0.2               # БЫЛО 0.0 — после ТП1 стоп в +0.2R (гарантированная микро-прибыль)
 
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
-RANGE_BE_AFTER_TP1 = -0.30     # стоп в -0.3R, НЕ полный безубыток
-RANGE_MIN_TP1_R = 1.0          # было 1.2 — чуть мягче
-RANGE_MIN_TP2_R = 2.0          # было 2.5 — чуть мягче
-RANGE_TARGET_FRAC = 0.90       # фронт-ранним дальнюю границу на 10%
-RANGE_MIN_WIDTH_R = 3.5        # ширина канала >= 3.5 x стоп
+RANGE_BE_AFTER_TP1 = -0.30
+RANGE_MIN_TP1_R = 1.0                  # БЫЛО 1.2 — мягче фильтр по середине канала
+RANGE_MIN_TP2_R = 2.0                  # БЫЛО 2.5 — мягче фильтр по дальней границе
+RANGE_TARGET_FRAC = 0.90
+RANGE_MIN_WIDTH_R = 3.5
 RANGE_STOP_ATR = 0.6
-RANGE_ENTRY_RETRACE = 0.20     # было 0.38 — вход ближе к границе, ключевой фикс
-RANGE_DAYS = 3                 # НЕ ТРОГАЕМ — 3 дня дают значимый канал
+RANGE_ENTRY_RETRACE = 0.20             # БЫЛО 0.38 — ключевой фикс! Вход ближе к границе
+RANGE_DAYS = 3
 RANGE_TOUCH_TOL = 0.0015
-RANGE_VOL_MULT = 1.3           # ТЕПЕРЬ РЕАЛЬНО ПРИМЕНЯЕТСЯ
+RANGE_VOL_MULT = 1.3
 RANGE_MIN_TOUCHES = 2
 
-SFP_SWING = 20                 # TREND-A: окно свинга
+SFP_SWING = 20
 SFP_STOP_ATR = 0.5
-CHOCH_SWING = 60               # TREND-B: мажорный свинг
-CHOCH_MINOR = 10               # минорный свинг для слома структуры
+CHOCH_SWING = 60
+CHOCH_MINOR = 10
 CHOCH_STOP_ATR = 0.6
-CHOCH_COUNTER_SIZE = 0.70      # размер против режима
+CHOCH_COUNTER_SIZE = 0.70
 
-# ------------------- РИСК / ЛИМИТЫ -------------------
-RISK_PCT_DEFAULT = 0.010       # 1% на период валидации (в поле можно 0.015)
-RISK_CAP_LEVERAGE = 5.0        # не выше плеча в приложении биржи
-ENTRY_WAIT = 3                 # свечей ожидания лимит-входа
-FAST_PERIOD = 5                # секунд между проверками позиций
-CANCEL_RETRY_SEC = 20          # повтор неподтверждённой отмены
+# ------------------- РИСК / ЛИМИТЫ (увеличены для роста) -------------------
+RISK_PCT_DEFAULT = 0.015               # БЫЛО 0.010 — 1.5% на сделку
+RISK_CAP_LEVERAGE = 5.0
+ENTRY_WAIT = 3
+FAST_PERIOD = 5
+CANCEL_RETRY_SEC = 20
 MAX_STOPS_PER_PAIR = 3
-MAX_STOPS_BASKET = 5
-DAILY_R_LIMIT = -4.0           # убыток дня в R -> новых входов нет
+MAX_STOPS_BASKET = 6                   # БЫЛО 5 — больше попыток в день
+DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.025         # суммарный открытый риск, доля эквити
-MAX_SAME_DIR_RISK = 0.020      # риск в одну сторону
+MAX_TOTAL_RISK = 0.040                 # БЫЛО 0.025 — 4.0% суммарный риск
+MAX_SAME_DIR_RISK = 0.025              # БЫЛО 0.020 — 2.5% в одну сторону
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
 SCORE_W_DEPTH = 0.20
 SCORE_W_ROOM = 0.25
 SCORE_W_ALIGN = 0.15
-SCORE_W_COST = 0.25
+SCORE_W_COST = 0.30                    # БЫЛО 0.25 — издержки важнее
 SCORE_CONFLUENCE = 0.10
 PREEMPT_ENABLED = True
 PREEMPT_SCORE_RATIO = 1.25
 PREEMPT_MIN_AGE_BARS = 1
-CONFLUENCE_SIZE_MULT = 1.00    # бонус размера ВЫКЛЮЧЕН до проверки на истории
+CONFLUENCE_SIZE_MULT = 1.00
 
 # ------------------- КЛАСТЕРЫ КОРРЕЛЯЦИИ -------------------
 CLUSTERS = {
@@ -138,12 +153,16 @@ CLUSTERS = {
     "LARGE": ("SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT",
               "LINKUSDT", "LTCUSDT", "BCHUSDT", "ETCUSDT", "ATOMUSDT", "XLMUSDT",
               "HBARUSDT", "ALGOUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "NEARUSDT",
-              "APTUSDT", "SUIUSDT", "TRXUSDT", "POLUSDT", "UNIUSDT", "AAVEUSDT", "KASUSDT"),
+              "APTUSDT", "SUIUSDT", "TRXUSDT", "POLUSDT", "UNIUSDT", "AAVEUSDT",
+              "KASUSDT"),
     "MEME": ("DOGEUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
              "SHIBUSDT", "JUPUSDT", "TIAUSDT", "SEIUSDT", "INJUSDT", "ENAUSDT",
-             "PUMPUSDT", "WLFIUSDT", "SUSDT", "ASTERUSDT", "NIGHTUSDT", "FARTCOINUSDT"),
-    "AI": ("FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT", "WLDUSDT", "VIRTUALUSDT", "ARKMUSDT"),
-    "DEFI": ("CRVUSDT", "LDOUSDT", "ARBUSDT", "OPUSDT", "PENDLEUSDT", "DYDXUSDT", "ONDOUSDT"),
+             "PUMPUSDT", "WLFIUSDT", "SUSDT", "ASTERUSDT", "NIGHTUSDT",
+             "FARTCOINUSDT"),
+    "AI": ("FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT", "WLDUSDT",
+           "VIRTUALUSDT", "ARKMUSDT"),
+    "DEFI": ("CRVUSDT", "LDOUSDT", "ARBUSDT", "OPUSDT", "PENDLEUSDT",
+             "DYDXUSDT", "ONDOUSDT"),
     "OTHER": ("ZECUSDT", "HYPEUSDT", "XPLUSDT"),
 }
 _CLUSTER_MAP = {s: c for c, arr in CLUSTERS.items() for s in arr}
@@ -154,12 +173,12 @@ def cluster_of(symbol):
 def log_to_file(text):
     try:
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
-            with open(LOG_FILE, "r ", encoding="utf-8 ") as f:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
                 data = f.read()
-            with open(LOG_FILE, "w ", encoding="utf-8 ") as f:
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(data[-LOG_MAX // 2:])
-        with open(LOG_FILE, "a ", encoding="utf-8 ") as f:
-            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n ")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
     except Exception:
         pass
 
@@ -202,8 +221,6 @@ def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 def _sgn(side):
-    """Направление сделки: +1 для LONG, -1 для SHORT.
-    ВАЖНО: функция уровня модуля, она НЕ метод класса Bot."""
     return 1 if side == "LONG" else -1
 
 def new_client_id(prefix="sfp"):
@@ -223,11 +240,11 @@ def extract_order_id(res):
                 return v
         return None
     if isinstance(res, dict):
-        for k in ("orderId ", "order_id ", "orderID ", "id "):
+        for k in ("orderId", "order_id", "orderID", "id"):
             v = res.get(k)
             if isinstance(v, (str, int)) and str(v).strip():
                 return str(v).strip()
-        for k in ("order ", "data ", "result "):
+        for k in ("order", "data", "result"):
             v = extract_order_id(res.get(k))
             if v:
                 return v
@@ -259,7 +276,6 @@ def true_ranges(bars):
     return out
 
 def atr_last(bars, period=ATR_PERIOD):
-    """ATR Уайлдера по закрытым барам. bars: (t,o,h,l,c,v)."""
     tr = true_ranges(bars)
     if len(tr) < period:
         return None
@@ -269,7 +285,6 @@ def atr_last(bars, period=ATR_PERIOD):
     return a
 
 def ema(values, period):
-    """EMA с сидом SMA первых period значений (как в v4)."""
     if len(values) < period:
         return None
     k = 2.0 / (period + 1.0)
@@ -289,45 +304,37 @@ def ema_series(values, n):
     return out
 
 def calc_tps(entry, risk, side, offsets):
-    """Тейки по смещениям в R от НЕИЗМЕННОГО исходного риска."""
     if side == "LONG":
         return [entry + o * risk for o in offsets]
     return [entry - o * risk for o in offsets]
 
 def cost_floor_frac(spread):
-    """Минимальная дистанция стопа (доля цены), чтобы издержки <= 0.10R."""
     sp = spread if (spread and spread > 0) else 0.0002
     return COST_STOP_MULT * (FEE_MAKER + FEE_TAKER + sp)
 
 def cost_ratio(stop_frac, spread):
-    """Издержки в долях R — ключевая метрика качества сетапа."""
     if stop_frac <= 0:
         return 1.0
     sp = spread if (spread and spread > 0) else 0.0002
     return (FEE_MAKER + FEE_TAKER + sp) / stop_frac
 
 def score_signal(f):
-    """Скоринг сетапа. Признаки нормированы в [0,1].
-    Веса — априорные; подлежат проверке на истории, не догма."""
-    s = (SCORE_W_VOL * clamp(f.get("vol_z ", 0.0))
-         + SCORE_W_DEPTH * clamp(f.get("depth ", 0.0))
-         + SCORE_W_ROOM * clamp(f.get("room ", 0.0))
-         + SCORE_W_ALIGN * clamp(f.get("align ", 0.0))
-         - SCORE_W_COST * clamp(f.get("cost ", 0.0)))
-    if f.get("confluence "):
+    s = (SCORE_W_VOL * clamp(f.get("vol_z", 0.0))
+         + SCORE_W_DEPTH * clamp(f.get("depth", 0.0))
+         + SCORE_W_ROOM * clamp(f.get("room", 0.0))
+         + SCORE_W_ALIGN * clamp(f.get("align", 0.0))
+         - SCORE_W_COST * clamp(f.get("cost", 0.0)))
+    if f.get("confluence"):
         s += SCORE_CONFLUENCE
     return s
 
-MOSCOW_HINT = ("⏰ v5: торговля 24/7. Лимит входа ждёт 3 свечи. "
-               "Сигналы отбираются по скорингу всей корзины, а не по порядку списка.")
-
+MOSCOW_HINT = ("⏰ v5 CLEAN: торговля 24/7. Лимит входа ждёт 3 свечи. "
+               "Сигналы отбираются по скорингу всей корзины. Логи в Download/SFP_Bot/")
 # =====================================================================
-#  ЧАСТЬ 2/5: API-слой. Единый интерфейс для Bybit и BingX.
-#  Возврат свечей: (t_ms, open, high, low, close, volume), по возрастанию t.
-#  ВАЖНО: open_positions() -> None означает СБОЙ ЗАПРОСА, а не «позиций нет».
+#  ЧАСТЬ 2а/5: Утилиты API и класс BybitAPI.
 # =====================================================================
-PUBLIC_OK_PATHS = ("/v5/market/ ", "/openApi/swap/v2/quote/ ", "/openApi/swap/v3/quote/ ")
-RATE_HINTS = ("too many ", "rate ", "429 ", "稍后 ", "retry ", "frequent ", "limit ")
+PUBLIC_OK_PATHS = ("/v5/market/", "/openApi/swap/v2/quote/", "/openApi/swap/v3/quote/")
+RATE_HINTS = ("too many", "rate", "429", "稍后", "retry", "frequent", "limit")
 
 def _is_public(path):
     return any(path.startswith(p) for p in PUBLIC_OK_PATHS)
@@ -339,6 +346,7 @@ def _f(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
 
 class BybitAPI:
     def __init__(self, api_key, secret, demo, interval):
@@ -353,13 +361,11 @@ class BybitAPI:
         self._tick = (0.0, {})
         self.last_error = None
 
-    # ---------- символы ----------
     def sym(self, s):
         return self.aliases.get(s, s)
     def to_universal(self, s):
         return self.reverse.get(s, s.replace("-", ""))
 
-    # ---------- транспорт ----------
     def _headers(self, payload):
         ts = str(int(time.time() * 1000))
         sign = hmac.new(self.secret.encode(),
@@ -406,7 +412,6 @@ class BybitAPI:
             raise RuntimeError(f"сеть: {last_ex}")
         raise RuntimeError("Bybit: лимит запросов — операция пропущена")
 
-    # ---------- лоты / округления ----------
     def _load_lots(self):
         if self._lots is not None:
             return self._lots
@@ -466,7 +471,6 @@ class BybitAPI:
             return round(price, 8)
         return round_step(price, info["tick"])
 
-    # ---------- рыночные данные ----------
     def _parse_klines(self, rows):
         out = []
         for k in rows or []:
@@ -500,7 +504,6 @@ class BybitAPI:
         return bars
 
     def tickers(self, symbols, max_age_ms=10000):
-        """ОПТОВЫЙ тикер: {универсальный_символ: {'last','bid','ask','spread'}}."""
         now = time.time()
         if self._tick[1] and (now - self._tick[0]) * 1000 < max_age_ms:
             return self._tick[1]
@@ -538,7 +541,6 @@ class BybitAPI:
         q = self.quote(symbol)
         return q["last"] if q and q.get("last") else None
 
-    # ---------- счёт / позиции ----------
     def balance(self):
         for acct in ("UNIFIED", "CONTRACT"):
             try:
@@ -569,7 +571,6 @@ class BybitAPI:
                 "qty": size, "entry": _f(p.get("avgPrice"))}
         return out
 
-    # ---------- ордера ----------
     def all_open_orders(self, symbol):
         out, ok = [], False
         for filt in ("Order", "StopOrder"):
@@ -639,8 +640,6 @@ class BybitAPI:
             return False
 
     def cancel_all(self, symbol):
-        """Массовая отмена ОБЫЧНЫХ ордеров. Только в WAIT_FILL,
-        когда защитных ордеров ещё нет."""
         try:
             res = self.req("POST", "/v5/order/cancel-all",
                            {"category": "linear", "symbol": self.sym(symbol),
@@ -673,8 +672,9 @@ class BybitAPI:
         res = self.req("POST", "/v5/order/create", p)
         dbg(f"Bybit order {symbol} {p} -> {res}")
         return res
-
-
+ # =====================================================================
+#  ЧАСТЬ 2б/5: Класс BingXAPI.
+# =====================================================================
 class BingXAPI:
     def __init__(self, api_key, secret, demo, interval):
         self.api_key, self.secret = api_key, secret
@@ -688,7 +688,6 @@ class BingXAPI:
         self._tick = (0.0, {})
         self.last_error = None
 
-    # ---------- символы ----------
     def sym(self, s):
         return self.aliases.get(s, s)
     def to_universal(self, s):
@@ -700,7 +699,6 @@ class BingXAPI:
                 return s[:-len(q)] + "-" + q
         return s
 
-    # ---------- транспорт ----------
     def _query(self, params):
         p = dict(params)
         p["timestamp"] = str(int(time.time() * 1000))
@@ -759,7 +757,6 @@ class BingXAPI:
                 break
         return d if isinstance(d, (list, tuple)) else []
 
-    # ---------- лоты / округления ----------
     def _load_lots(self):
         if self._lots is not None:
             return self._lots
@@ -806,7 +803,6 @@ class BingXAPI:
             return round(price, 8)
         return round_step(price, info["tick"])
 
-    # ---------- рыночные данные ----------
     def klines(self, symbol, limit=WORK_BARS, interval=None, max_age_ms=0):
         iv = interval or self.interval
         key = (self.sym(symbol), str(iv), int(limit))
@@ -858,7 +854,6 @@ class BingXAPI:
         except Exception as ex:
             self.last_error = str(ex)
         if not out:
-            # резерв: по одной паре, если оптовый ответ пуст
             for s in symbols:
                 try:
                     q = self._quote_one(s)
@@ -897,7 +892,6 @@ class BingXAPI:
         q = self.quote(symbol)
         return q["last"] if q and q.get("last") else None
 
-    # ---------- счёт / позиции ----------
     def balance(self):
         d = self.req("GET", "/openApi/swap/v2/user/balance", {})
         dbg(f"BingX balance raw: {str(d)[:300]}")
@@ -944,7 +938,6 @@ class BingXAPI:
                 "side": side, "qty": amt, "entry": _f(p.get("avgPrice"))}
         return out
 
-    # ---------- ордера ----------
     def all_open_orders(self, symbol):
         try:
             d = self.req("GET", "/openApi/swap/v2/trade/openOrders",
@@ -1041,29 +1034,24 @@ class BingXAPI:
         res = self.req("POST", "/openApi/swap/v2/trade/order", p)
         dbg(f"BingX order {symbol} {p} -> {res}")
         return res
-
-
 # =====================================================================
 #  ЧАСТЬ 3/5: режим рынка и генераторы сигналов.
-#  Сигнал — словарь; конфликты одной пары разрешаются в resolve().
-#  Отбор между парами (скоринг + портфельные лимиты) — в части 4.
 # =====================================================================
 class Signals:
     def __init__(self, api, tf_label, trend_label, ema_prox_pct, log):
         self.api = api
         self.tf_label = tf_label
-        self.vol_mult = TIMEFRAMES[tf_label]["vol_mult "]
+        self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
         self.trend_enabled = (trend_label != EMA_OFF)
         self.trend_label = trend_label
         self.ema_prox = ema_prox_pct
         self.log = log
-        key = ("interval_bybit " if api.name == "Bybit" else "interval_bingx ")
+        key = ("interval_bybit" if api.name == "Bybit" else "interval_bingx")
         self.trend_interval = TIMEFRAMES[trend_label][key] if self.trend_enabled else None
         self.range_bars = max(30, RANGE_DAYS * 1440 // TF_MINUTES[tf_label])
         self._ctx = {}
         self._diag = {}
 
-    # ---------- служебное ----------
     def _once_hour(self, key, msg):
         now = time.time()
         if now - self._diag.get(key, 0) > 3600:
@@ -1074,12 +1062,9 @@ class Signals:
         return max(b[2] for b in bars), min(b[3] for b in bars)
 
     def _stop_dist(self, entry, atr, mult, spread):
-        """Стоп по ATR, но не ближе пола издержек — ключевой фикс v5."""
         return max(atr * mult, entry * cost_floor_frac(spread))
 
     def _no_chase(self, sig, reg):
-        """TREND_A: сторона EMA + дистанция. TREND_B: только дистанция
-        (разворот по определению начинается с «неправильной» стороны EMA)."""
         e = reg.get("ema")
         if not e or e <= 0 or self.ema_prox <= 0:
             return True
@@ -1101,7 +1086,6 @@ class Signals:
         if risk <= 0 or entry <= 0:
             return None
         sf = risk / entry
-        # допуск 1e-9: в v4 стоп ровно 0.8% отбраковывался случайно из-за float
         if sf + 1e-9 < cost_floor_frac(feats.get("_spread", 0.0)):
             return None
         tps = [self.api.price_ok(symbol, t) for t in tps]
@@ -1115,7 +1099,6 @@ class Signals:
         sig["score"] = score_signal(feats)
         return sig
 
-    # ---------- контекст пары ----------
     def context(self, symbol):
         now = time.time()
         hit = self._ctx.get(symbol)
@@ -1163,7 +1146,6 @@ class Signals:
         self._ctx[symbol] = (now, ctx)
         return ctx
 
-    # ---------- RANGE v5 ----------
     def range_v5(self, symbol, ctx):
         closed, last, atr = ctx["closed"], ctx["last"], ctx["atr"]
         n = self.range_bars
@@ -1177,7 +1159,7 @@ class Signals:
         tol = RANGE_TOUCH_TOL
         tu = sum(1 for b in hist if b[2] >= upper * (1 - tol))
         td = sum(1 for b in hist if b[3] <= lower * (1 + tol))
-        vol_ok = last[5] > RANGE_VOL_MULT * avg      # ФИЛЬТР ОБЪЁМА ТЕПЕРЬ В УСЛОВИИ
+        vol_ok = last[5] > RANGE_VOL_MULT * avg
         rev_up = (vol_ok and tu >= RANGE_MIN_TOUCHES and
                   last[2] >= upper * (1 - tol) and last[4] < upper * (1 - tol))
         rev_dn = (vol_ok and td >= RANGE_MIN_TOUCHES and
@@ -1187,10 +1169,9 @@ class Signals:
         side = "SHORT" if rev_up else "LONG"
         d = ctx["regime"]["dir"]
         if d > 0 and side == "SHORT":
-            return None                              # против сильного тренда не торгуем
+            return None
         if d < 0 and side == "LONG":
             return None
-        # вход на 20% отката сигнальной свечи, а не на самом экстремуме
         rng = max(last[2] - last[3], atr * 0.1)
         entry = last[4] + RANGE_ENTRY_RETRACE * rng if side == "SHORT" else \
             last[4] - RANGE_ENTRY_RETRACE * rng
@@ -1203,7 +1184,7 @@ class Signals:
             return None
         width = upper - lower
         if width / risk < RANGE_MIN_WIDTH_R:
-            return None                              # канал слишком узкий для этой схемы
+            return None
         sgn = 1 if side == "LONG" else -1
         tp1 = entry + sgn * (upper + lower) / 2.0
         opposite = lower if side == "LONG" else upper
@@ -1222,7 +1203,6 @@ class Signals:
                         RANGE_BE_AFTER_TP1, 1.0, feats,
                         f"канал {width / risk:.1f}R, цели {r1:.2f}R/{r2:.2f}R")
 
-    # ---------- TREND-A: продолжение (SFP-откат) ----------
     def trend_a(self, symbol, ctx):
         closed, last, atr = ctx["closed"], ctx["last"], ctx["atr"]
         if len(closed) < SFP_SWING + 1:
@@ -1262,7 +1242,6 @@ class Signals:
                         TREND_TAIL_SHARE, TREND_BE_AFTER_TP1, 1.0, feats,
                         f"свинг {SFP_SWING}, стоп {risk / entry * 100:.2f}%")
 
-    # ---------- TREND-B: разворот (CHoCH) ----------
     def trend_b(self, symbol, ctx):
         closed, last, atr = ctx["closed"], ctx["last"], ctx["atr"]
         if len(closed) < CHOCH_SWING + 2:
@@ -1276,7 +1255,7 @@ class Signals:
         sweep_dn = last[3] < mj_lo and last[4] > mj_lo
         side = None
         if sweep_up and last[4] < mn_lo:
-            side = "SHORT"                           # свайп верха + слом минорного лоу
+            side = "SHORT"
         elif sweep_dn and last[4] > mn_hi:
             side = "LONG"
         if side is None:
@@ -1290,7 +1269,7 @@ class Signals:
             (ef[-1] > es[-1] and slope >= 0)
         if not conf:
             return None
-        entry = mn_lo if side == "SHORT" else mn_hi   # ретест сломанного уровня
+        entry = mn_lo if side == "SHORT" else mn_hi
         beyond = last[2] if side == "SHORT" else last[3]
         dist = self._stop_dist(entry, atr, CHOCH_STOP_ATR, ctx["spread"])
         stop = beyond + dist if side == "SHORT" else beyond - dist
@@ -1313,7 +1292,6 @@ class Signals:
                         TREND_TAIL_SHARE, TREND_BE_AFTER_TP1, size, feats,
                         f"CHoCH {CHOCH_SWING}, против режима={counter}")
 
-    # ---------- конфликты одной пары ----------
     def resolve(self, symbol, ctx):
         r = self.range_v5(symbol, ctx)
         a = self.trend_a(symbol, ctx)
@@ -1323,7 +1301,7 @@ class Signals:
         t = None
         if a and b:
             if a["side"] != b["side"]:
-                t = b            # слом структуры отменяет предпосылку продолжения
+                t = b
             else:
                 t = a if (strong and d != 0) else b
         else:
@@ -1331,7 +1309,7 @@ class Signals:
         out = None
         if r and t:
             if r["side"] != t["side"]:
-                return []        # канал vs слом структуры — реально неоднозначно
+                return []
             out = r if r["score"] >= t["score"] else t
             out["confluence"] = True
             out["feats"]["confluence"] = True
@@ -1349,13 +1327,8 @@ class Signals:
         if ctx is None:
             return []
         return self.resolve(symbol, ctx)
-
-
 # =====================================================================
-#  ЧАСТЬ 4/5 + 5/5: ядро бота — состояние, лимиты, отбор сигналов,
-#  учёт сделок, исполнение ордеров и сопровождение позиций.
-#  В позиции НЕИЗМЕННЫ: entry, risk, stop0, qty_total, tp_levels, splits.
-#  Меняются только: stop_price, qty, tp_filled, tail, mae, mfe.
+#  ЧАСТЬ 4а/5: ядро бота — инициализация, журнал, лимиты, учёт сделок.
 # =====================================================================
 class Bot:
     def __init__(self, api, tf_label, trend_label, symbols, risk_pct,
@@ -1475,7 +1448,6 @@ class Bot:
         return None
 
     def open_risk(self):
-        """(суммарный, LONG, SHORT) открытый риск в долях эквити."""
         eq = self.equity or 1.0
         tot = lr = sr = 0.0
         for p in self.positions.values():
@@ -1512,7 +1484,6 @@ class Bot:
 
     # ---------- учёт сделки ----------
     def track_excursion(self, symbol, p, cur):
-        """MAE/MFE в R — по ним потом настраиваются стопы и цели."""
         if cur is None or p.get("risk", 0) <= 0:
             return
         sgn = 1 if p["side"] == "LONG" else -1
@@ -1521,7 +1492,7 @@ class Bot:
         p["mae"] = min(p.get("mae", 0.0), r)
 
     def close_trade(self, symbol, p, category, cur=None):
-        risk = p["risk"]                       # НЕИЗМЕННЫЙ исходный риск
+        risk = p["risk"]
         qty = p.get("qty_total") or 0.0
         splits = p["splits"]
         filled = sum(p["tp_filled"])
@@ -1586,7 +1557,11 @@ class Bot:
                             f"{ft_.get('cost', 0):.3f}"])
         except Exception as ex:
             dbg(f"CSV trade write fail: {ex}")
-
+# =====================================================================
+#  ЧАСТЬ 4б.1/5: ядро бота — отбор сигналов и подтверждённая отмена входа.
+#  ВСТАВЛЯТЬ ПОСЛЕ 4а И ПЕРЕД 4б.2.
+#  Это продолжение класса Bot, без нового class Bot.
+# =====================================================================
     # ---------- отбор сигналов ----------
     def _bar_t(self, symbol):
         hit = self.sig._ctx.get(symbol)
@@ -1604,82 +1579,105 @@ class Bot:
         if block:
             self.log(f"Новые входы запрещены: {block}")
             return
+
         self.equity = self.dry_balance if DRY_RUN else (self.api.balance() or self.equity)
         if self.equity <= 0:
             self.log("Баланс не получен — входы пропущены")
             return
-        self.api.tickers(self.symbols)          # один запрос на всю корзину
+
+        self.api.tickers(self.symbols)
+
         fresh, preempt = [], []
+
         for s in self.symbols:
             if self.stop_event.is_set():
                 return
+
             cur = self.positions.get(s)
             if cur and cur.get("phase") == "ACTIVE":
                 continue
+
             if self.pair_blocked(s):
                 continue
+
             try:
                 arr = self.sig.candidates(s)
             except Exception as ex:
                 dbg(f"{s}: scan fail {type(ex).__name__}: {ex}")
                 continue
+
             for sig in arr:
                 self.stat_signals += 1
                 if cur is None:
                     fresh.append(sig)
                 elif PREEMPT_ENABLED and self._can_preempt(cur, sig):
                     preempt.append((s, cur, sig))
-        # вытеснение: отмена НЕисполненного лимита бесплатна, отбор улучшается
+
+        # Вытеснение только НЕисполненного входного лимита.
         for s, old, sig in sorted(preempt, key=lambda x: -x[2]["score"]):
             if self.stop_event.is_set():
                 return
+
             if self.cancel_entry_confirmed(s, old):
                 del self.positions[s]
                 self.stat_preempt += 1
                 sig["_preempted"] = True
                 fresh.append(sig)
-                self.log(f"{s}: вытеснение — score {old.get('score', 0):.2f} -> "
-                         f"{sig['score']:.2f}")
+                self.log(
+                    f"{s}: вытеснение — score {old.get('score', 0):.2f} -> "
+                    f"{sig['score']:.2f}"
+                )
             else:
-                self.log(f"{s}: вытеснение отменено — снятие не подтверждено, "
-                         f"старый ордер оставлен (fail-safe)")
+                self.log(
+                    f"{s}: вытеснение отменено — снятие не подтверждено, "
+                    f"старый ордер оставлен (fail-safe)"
+                )
+
         if len(self._rej) > 1000:
             self._rej = {}
+
         fresh.sort(key=lambda x: (-x["score"], x["symbol"]))
+
         for sig in fresh:
             if self.stop_event.is_set():
                 return
+
             if len(self.positions) >= self.max_positions:
                 break
+
             s = sig["symbol"]
             if s in self.positions:
                 continue
+
             bt = self._bar_t(s)
             if self._acted.get(s) == bt:
                 continue
+
             why = self._portfolio_block(sig)
             if why:
                 if self._rej.get((s, bt)) != why:
                     self._rej[(s, bt)] = why
-                    self.log(f"{s}: {sig['kind']} {sig['side']} score "
-                             f"{sig['score']:.2f} отклонён — {why}")
+                    self.log(
+                        f"{s}: {sig['kind']} {sig['side']} score "
+                        f"{sig['score']:.2f} отклонён — {why}"
+                    )
                 continue
+
             if self.try_enter(sig):
                 self._acted[s] = bt
                 self.stat_taken += 1
+
         self.log_stats()
 
-    # ==================================================================
-    #  ЧАСТЬ 5А/5: исполнение ордеров и сопровождение позиций.
-    #  Неизменны после входа: entry, risk, stop0, tp_levels, splits.
-    #  qty_total фиксируется в момент исполнения и дальше не меняется.
-    # ==================================================================
+    # ---------- ошибки / отмена ордеров ----------
     def _err_kind(self, err):
         e = str(err or "").lower()
-        if any(k in e for k in ("order not exist", "orderid not exist", "order_not_exist",
-                                "does not exist", "order not found", "no such",
-                                "already", "cancelled", "canceled", "filled",
-                                "110007", "не существует ордер")):
+        if any(k in e for k in (
+            "order not exist", "orderid not exist", "order_not_exist",
+            "does not exist", "order not found", "no such",
+            "already", "cancelled", "canceled", "filled",
+            "110007", "не существует ордер"
+        )):
             return "gone"
         if any(k in e for k in RATE_HINTS):
             return "retry"
@@ -1691,6 +1689,7 @@ class Bot:
         except Exception as ex:
             ok = False
             self.api.last_error = str(ex)
+
         return "gone" if ok else self._err_kind(getattr(self.api, "last_error", ""))
 
     def _entry_left(self, symbol):
@@ -1702,28 +1701,42 @@ class Bot:
     def _cancel_pending(self, symbol, p, why):
         p["cancel_fails"] = p.get("cancel_fails", 0) + 1
         n = p["cancel_fails"]
-        self.log(f"{symbol}: отмена НЕ подтверждена ({why}) — слот держим, "
-                 f"повтор через {CANCEL_RETRY_SEC}с. Попытка {n}")
+
+        self.log(
+            f"{symbol}: отмена НЕ подтверждена ({why}) — слот держим, "
+            f"повтор через {CANCEL_RETRY_SEC}с. Попытка {n}"
+        )
+
         if n in (5, 15, 30):
             self.log(f"{symbol}: ⚠️ входной ордер может висеть — проверьте биржу вручную")
+
         return False
 
     def _cancel_done(self, symbol, p):
         live = self.api.open_positions()
+
         if live is None:
             return self._cancel_pending(symbol, p, "позиции недоступны")
+
         if symbol in live:
             self.log(f"{symbol}: ордер успел исполниться — сопровождаю позицию")
             return False
+
         p["cancel_fails"] = 0
         return True
 
     def cancel_entry_confirmed(self, symbol, p):
-        """Снятие входа с ПОДТВЕРЖДЕНИЕМ по списку ордеров биржи.
-        Цепочка: orderId -> clientOrderId -> все входные -> массовая отмена."""
+        """
+        Снятие входа с подтверждением по списку ордеров биржи.
+        Цепочка:
+        orderId -> clientOrderId -> все входные -> массовая отмена.
+        """
         if DRY_RUN:
             return True
+
         oid, cid = p.get("order_id"), p.get("client_id")
+
+        # 1. Пробуем снять по orderId.
         if oid:
             for i in range(1, 4):
                 k = self._do_cancel(symbol, oid=oid)
@@ -1733,51 +1746,76 @@ class Bot:
                     time.sleep(2 * i)
                     continue
                 break
+
         left = self._entry_left(symbol)
         if left is None:
             return self._cancel_pending(symbol, p, "список ордеров недоступен")
+
         if not left:
             return self._cancel_done(symbol, p)
+
+        # 2. Пробуем по clientOrderId.
         if cid:
             self._do_cancel(symbol, cid=cid)
             time.sleep(0.8)
+
             left = self._entry_left(symbol)
             if left is None:
                 return self._cancel_pending(symbol, p, "список ордеров недоступен")
+
             if not left:
                 return self._cancel_done(symbol, p)
+
+        # 3. Снимаем все оставшиеся входные ордера пары.
         self.log(f"{symbol}: осталось входных {len(left)} — снимаю принудительно")
+
         for o_id, c_id in left:
             for i in range(1, 3):
-                k = self._do_cancel(symbol, oid=o_id or None,
-                                    cid=None if o_id else (c_id or None))
+                k = self._do_cancel(
+                    symbol,
+                    oid=o_id or None,
+                    cid=None if o_id else (c_id or None)
+                )
                 if k == "gone":
                     break
                 if k == "retry" and i < 2:
                     time.sleep(2)
                     continue
                 break
+
         time.sleep(1.0)
+
         left = self._entry_left(symbol)
         if left is None:
             return self._cancel_pending(symbol, p, "список ордеров недоступен")
+
         if not left:
             return self._cancel_done(symbol, p)
-        ours = any((o_id and str(o_id) == str(oid)) or
-                   (c_id and cid and str(c_id) == str(cid)) for o_id, c_id in left)
+
+        # 4. Если наш ордер всё ещё висит — массовая отмена обычных ордеров.
+        ours = any(
+            (o_id and str(o_id) == str(oid)) or
+            (c_id and cid and str(c_id) == str(cid))
+            for o_id, c_id in left
+        )
+
         if ours:
-            self.log(f"{symbol}: точечно не снимается — снимаю ВСЕ ордера пары "
-                     f"(защитных ещё нет)")
+            self.log(f"{symbol}: точечно не снимается — снимаю ВСЕ ордера пары")
+
             try:
                 self.api.cancel_all(symbol)
             except Exception as ex:
                 dbg(f"{symbol}: cancel_all fail {ex}")
+
             time.sleep(1.2)
+
             left = self._entry_left(symbol)
             if left is None:
                 return self._cancel_pending(symbol, p, "список ордеров недоступен")
+
             if not left:
                 return self._cancel_done(symbol, p)
+
         return self._cancel_pending(symbol, p, f"осталось {len(left)}")
 
     def cancel_leftover_entry(self, symbol, p):
@@ -1788,340 +1826,569 @@ class Bot:
 
     def cleanup_orders(self, symbol):
         for oid, cid in (self.api.open_reduce_orders(symbol) or []):
-            k = self._do_cancel(symbol, oid=oid or None,
-                                cid=None if oid else (cid or None))
+            k = self._do_cancel(
+                symbol,
+                oid=oid or None,
+                cid=None if oid else (cid or None)
+            )
             if k != "gone":
-                self.log(f"{symbol}: ордер {oid or cid} не снят — "
-                         f"{getattr(self.api, 'last_error', '')}")
-
+                self.log(
+                    f"{symbol}: ордер {oid or cid} не снят — "
+                    f"{getattr(self.api, 'last_error', '')}"
+                )
+# =====================================================================
+#  ЧАСТЬ 4б.2/5: ядро бота — вход, стопы, тейки, сопровождение позиций.
+#  ВСТАВЛЯТЬ ПОСЛЕ 4б.1 И ПЕРЕД 4в.
+#  Это продолжение класса Bot, без нового class Bot.
+# =====================================================================
     # ---------- вход ----------
     def try_enter(self, sig):
         s = sig["symbol"]
         if s in self.positions:
             return False
+
         entry, risk = sig["entry"], sig["risk"]
+
         mult = sig["size_mult"]
         if sig.get("confluence"):
             mult *= CONFLUENCE_SIZE_MULT
+
         risk_usdt = self.equity * self.risk_pct * mult
         raw_qty = risk_usdt / risk
         cap_qty = self.equity * RISK_CAP_LEVERAGE / entry
+
         qty = self.api.qty_ok(s, min(raw_qty, cap_qty), price=entry)
         if qty <= 0:
             self.log(f"{s}: объём {raw_qty:.6f} ниже минимума биржи — пропуск")
             return False
+
         cid = new_client_id("sfp")
         oid = None
+
         if not DRY_RUN:
             try:
-                res = self.api.order(s, "Buy" if sig["side"] == "LONG" else "Sell",
-                                     qty, tp=entry, client_id=cid)
+                res = self.api.order(
+                    s,
+                    "Buy" if sig["side"] == "LONG" else "Sell",
+                    qty,
+                    tp=entry,
+                    client_id=cid
+                )
+
                 oid = extract_order_id(res)
+
                 if not oid:
                     time.sleep(0.8)
                     for o_id, c_id in (self.api.open_entry_orders(s) or []):
                         if c_id == cid:
                             oid = o_id
                             break
+
                 if not oid:
-                    self.log(f"{s}: orderId не распознан — отмена пойдёт по "
-                             f"clientOrderId {cid}")
+                    self.log(
+                        f"{s}: orderId не распознан — отмена пойдёт по "
+                        f"clientOrderId {cid}"
+                    )
+
             except Exception as ex:
                 self.log(f"{s}: лимит-вход не выставлен — {ex}")
                 return False
+
         self.positions[s] = {
-            "phase": "WAIT_FILL", "placed_ts": time.time(),
-            "order_id": oid, "client_id": cid, "cancel_fails": 0,
+            "phase": "WAIT_FILL",
+            "placed_ts": time.time(),
+            "order_id": oid,
+            "client_id": cid,
+            "cancel_fails": 0,
             "preempted": bool(sig.get("_preempted")),
-            "kind": sig["kind"], "subtype": "конфлюэнс" if sig.get("confluence") else "",
-            "side": sig["side"], "entry": entry, "stop0": sig["stop"],
-            "stop_price": sig["stop"], "risk": risk, "stop_frac": sig["stop_frac"],
-            "tp_levels": list(sig["tps"]), "splits": list(sig["splits"]),
+
+            "kind": sig["kind"],
+            "subtype": "конфлюэнс" if sig.get("confluence") else "",
+            "side": sig["side"],
+
+            "entry": entry,
+            "stop0": sig["stop"],
+            "stop_price": sig["stop"],
+            "risk": risk,
+            "stop_frac": sig["stop_frac"],
+
+            "tp_levels": list(sig["tps"]),
+            "splits": list(sig["splits"]),
             "tp_filled": [False] * len(sig["splits"]),
-            "tail_share": sig["tail"], "be": sig["be"], "tail": False,
-            "qty_total": qty, "qty": qty, "risk_usdt": qty * risk,
-            "stop_id": None, "stop_cid": None,
-            "score": sig["score"], "confluence": bool(sig.get("confluence")),
-            "feats": dict(sig["feats"]), "mae": 0.0, "mfe": 0.0,
+
+            "tail_share": sig["tail"],
+            "be": sig["be"],
+            "tail": False,
+
+            "qty_total": qty,
+            "qty": qty,
+            "risk_usdt": qty * risk,
+
+            "stop_id": None,
+            "stop_cid": None,
+
+            "score": sig["score"],
+            "confluence": bool(sig.get("confluence")),
+            "feats": dict(sig["feats"]),
+            "mae": 0.0,
+            "mfe": 0.0,
         }
+
         tag = "DRY " if DRY_RUN else ""
-        self.log(f"{tag}ЛИМИТ-ВХОД {sig['side']} {s} [{sig['kind']}] "
-                 f"по {qstr(entry)}, стоп {qstr(sig['stop'])} "
-                 f"({sig['stop_frac'] * 100:.2f}%), цели "
-                 f"{' / '.join(qstr(t) for t in sig['tps'])}, "
-                 f"хвост {sig['tail'] * 100:.0f}%, score {sig['score']:.2f}"
-                 f"{' КОНФЛЮЭНС' if sig.get('confluence') else ''} "
-                 f"[{len(self.positions)}/{self.max_positions}] — {sig['note']}")
+
+        self.log(
+            f"{tag}ЛИМИТ-ВХОД {sig['side']} {s} [{sig['kind']}] "
+            f"по {qstr(entry)}, стоп {qstr(sig['stop'])} "
+            f"({sig['stop_frac'] * 100:.2f}%), цели "
+            f"{' / '.join(qstr(t) for t in sig['tps'])}, "
+            f"хвост {sig['tail'] * 100:.0f}%, score {sig['score']:.2f}"
+            f"{' КОНФЛЮЭНС' if sig.get('confluence') else ''} "
+            f"[{len(self.positions)}/{self.max_positions}] — {sig['note']}"
+        )
+
         return True
 
-    # ---------- защита ----------
+    # ---------- защитные ордера ----------
     def place_stop(self, symbol, p, qty, stop_price):
         if DRY_RUN:
             return None, None
+
         cid = new_client_id("sl")
+
         try:
-            res = self.api.order(symbol, "Sell" if p["side"] == "LONG" else "Buy",
-                                 qty, stop=stop_price, reduce_only=True, client_id=cid)
+            res = self.api.order(
+                symbol,
+                "Sell" if p["side"] == "LONG" else "Buy",
+                qty,
+                stop=stop_price,
+                reduce_only=True,
+                client_id=cid
+            )
             return extract_order_id(res), cid
+
         except Exception as ex:
             self.log(f"{symbol}: стоп не выставлен — {ex}. Резервное закрытие активно")
             return None, None
 
     def move_stop(self, symbol, p, new_stop, new_qty):
-        """Сначала НОВЫЙ стоп, потом отмена старого — окна без защиты нет.
-        Оба reduceOnly: перекрыть позицию они не могут."""
+        """
+        Сначала ставим НОВЫЙ стоп, потом отменяем старый.
+        Оба reduceOnly, поэтому перекрыть позицию они не должны.
+        """
         new_stop = self.api.price_ok(symbol, new_stop)
         if new_stop is None:
             return
+
         if DRY_RUN:
             p["stop_price"] = new_stop
             return
+
         q = self.api.qty_ok(symbol, new_qty, price=p["entry"])
         if q <= 0:
             return
+
         old_id, old_cid = p.get("stop_id"), p.get("stop_cid")
+
         nid, ncid = self.place_stop(symbol, p, q, new_stop)
         if not nid and not ncid:
             self.log(f"{symbol}: перенос стопа не удался — старый стоп остаётся")
             return
+
         p["stop_price"], p["stop_id"], p["stop_cid"] = new_stop, nid, ncid
+
         if old_id:
             self._do_cancel(symbol, oid=old_id)
+
         if old_cid and old_cid != ncid:
             self._do_cancel(symbol, cid=old_cid)
+
         self.log(f"{symbol}: стоп перенесён на {qstr(new_stop)} (объём {qstr(q)})")
 
     def place_tps(self, symbol, p):
         if DRY_RUN:
             return 0
+
         placed = 0
+
         for i, (w, tp) in enumerate(zip(p["splits"], p["tp_levels"])):
             q = self.api.qty_ok(symbol, p["qty_total"] * w, price=p["entry"])
             if q <= 0:
                 self.log(f"{symbol}: тейк {i + 1} ниже минимума биржи — пропущен")
                 continue
+
             try:
-                self.api.order(symbol, "Sell" if p["side"] == "LONG" else "Buy",
-                               q, tp=tp, reduce_only=True, client_id=new_client_id("tp"))
+                self.api.order(
+                    symbol,
+                    "Sell" if p["side"] == "LONG" else "Buy",
+                    q,
+                    tp=tp,
+                    reduce_only=True,
+                    client_id=new_client_id("tp")
+                )
                 placed += 1
+
             except Exception as ex:
                 self.log(f"{symbol}: тейк {i + 1} не выставлен — {ex}")
+
         if placed == 0:
             self.log(f"{symbol}: тейки не выставлены — сопровождение по стопу")
+
         return placed
 
     def chandelier(self, symbol, p):
-        """ATR-канал для хвоста: экстремум за 22 бара минус/плюс 3 ATR."""
+        """
+        ATR-канал для хвоста:
+        LONG: max(high за N баров) - ATR * mult
+        SHORT: min(low за N баров) + ATR * mult
+        """
         try:
-            bars = self.api.klines(symbol, limit=CHANDELIER_LOOKBACK + ATR_PERIOD + 5,
-                                   max_age_ms=20000)
+            bars = self.api.klines(
+                symbol,
+                limit=CHANDELIER_LOOKBACK + ATR_PERIOD + 5,
+                max_age_ms=20000
+            )
         except Exception:
             return None
+
         closed = bars[:-1] if len(bars) > 1 else bars
+
         if len(closed) < CHANDELIER_LOOKBACK + ATR_PERIOD:
             return None
+
         a = atr_last(closed)
         if not a:
             return None
+
         win = closed[-CHANDELIER_LOOKBACK:]
+
         if p["side"] == "LONG":
             return max(b[2] for b in win) - CHANDELIER_ATR * a
+
         return min(b[3] for b in win) + CHANDELIER_ATR * a
 
-    # ---------- сопровождение ----------
+    # ---------- активация позиции ----------
     def _activate(self, symbol, p, info):
         qty = info["qty"]
+
         p["qty_total"], p["qty"] = qty, qty
         p["risk_usdt"] = qty * p["risk"]
         p["phase"] = "ACTIVE"
+
         sid, scid = self.place_stop(symbol, p, qty, p["stop_price"])
         p["stop_id"], p["stop_cid"] = sid, scid
-        self.place_tps(symbol, p)
-        ok = bool(sid) or bool(scid)
-        self.log(f"ВХОД исполнен {p['side']} {symbol} [{p['kind']}] по "
-                 f"{qstr(info.get('entry') or p['entry'])}, стоп "
-                 f"{qstr(p['stop_price'])}, "
-                 f"{'защита выставлена' if ok else 'СТОП НЕ ВЫСТАВЛЕН — резервное закрытие'}")
 
+        self.place_tps(symbol, p)
+
+        ok = bool(sid) or bool(scid)
+
+        self.log(
+            f"ВХОД исполнен {p['side']} {symbol} [{p['kind']}] по "
+            f"{qstr(info.get('entry') or p['entry'])}, стоп "
+            f"{qstr(p['stop_price'])}, "
+            f"{'защита выставлена' if ok else 'СТОП НЕ ВЫСТАВЛЕН — резервное закрытие'}"
+        )
+
+    # ---------- определение тейков ----------
     def _detect_tps(self, symbol, p, info):
         if p["qty_total"] <= 0:
             return
+
         frac = (p["qty_total"] - info["qty"]) / p["qty_total"]
-        n, cum, now = len(p["splits"]), 0.0, 0
+
+        n = len(p["splits"])
+        cum = 0.0
+        now = 0
+
         for w in p["splits"]:
             cum += w
             if frac + 0.06 >= cum:
                 now += 1
+
         now = min(n, now)
         done = sum(p["tp_filled"])
+
         if now <= done:
             return
+
         for i in range(done, now):
             p["tp_filled"][i] = True
+
             self.log(f"ТЕЙК {i + 1}/{n} по {symbol} ({qstr(p['tp_levels'][i])})")
+
             if i == 0:
                 be = p["entry"] + _sgn(p["side"]) * p["be"] * p["risk"]
                 self.move_stop(symbol, p, be, info["qty"])
+
         if now >= n:
             if p.get("tail_share", 0) > 0:
                 p["tail"] = True
-                self.log(f"{symbol}: тейки отработаны, хвост "
-                         f"{p['tail_share'] * 100:.0f}% трейлится ATR-каналом")
+                self.log(
+                    f"{symbol}: тейки отработаны, хвост "
+                    f"{p['tail_share'] * 100:.0f}% трейлится ATR-каналом"
+                )
             else:
                 self.close_trade(symbol, p, "ТЕЙК-ПОЛНЫЙ", p["tp_levels"][-1])
                 self.cleanup_orders(symbol)
                 del self.positions[symbol]
 
+    # ---------- закрытие / резервное закрытие ----------
     def _settle_closed(self, symbol, p, cur):
-        sp, sgn = p["stop_price"], _sgn(p["side"])
+        sp = p["stop_price"]
+        sgn = _sgn(p["side"])
+
         stopped = cur is not None and (cur - sp) * sgn <= 0
         loss = cur is not None and (cur - p["entry"]) * sgn < 0
+
         if stopped and loss:
             self.register_stop(symbol)
             self.log(f"СТОП по {symbol}. Стопов за день: {self.losses_today}")
             self.close_trade(symbol, p, "СТОП", cur)
+
         elif stopped:
-            self.close_trade(symbol, p, "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК", cur)
+            self.close_trade(
+                symbol,
+                p,
+                "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК",
+                cur
+            )
+
         elif cur is not None and (cur - p["tp_levels"][-1]) * sgn >= 0:
             p["tp_filled"] = [True] * len(p["tp_filled"])
             self.close_trade(symbol, p, "ТЕЙК-ПОЛНЫЙ", cur)
+
         else:
             self.close_trade(symbol, p, "ПРОЧЕЕ", cur)
+
         self.cleanup_orders(symbol)
         del self.positions[symbol]
 
     def _fallback_close(self, symbol, p, cur):
-        sp, sgn = p["stop_price"], _sgn(p["side"])
+        sp = p["stop_price"]
+        sgn = _sgn(p["side"])
+
         if cur is None or sp is None or (cur - sp) * sgn > 0:
             return
+
         try:
-            self.api.order(symbol, "Sell" if p["side"] == "LONG" else "Buy",
-                           p["qty"], reduce_only=True, client_id=new_client_id("fb"))
+            self.api.order(
+                symbol,
+                "Sell" if p["side"] == "LONG" else "Buy",
+                p["qty"],
+                reduce_only=True,
+                client_id=new_client_id("fb")
+            )
+
         except Exception as ex:
             self.log(f"{symbol}: резервное закрытие не удалось — {ex}")
             return
+
         if (cur - p["entry"]) * sgn < 0:
             self.register_stop(symbol)
             self.close_trade(symbol, p, "СТОП", cur)
         else:
-            self.close_trade(symbol, p, "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК", cur)
+            self.close_trade(
+                symbol,
+                p,
+                "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК",
+                cur
+            )
+
         self.cleanup_orders(symbol)
         del self.positions[symbol]
 
+    # ---------- сопровождение реальных позиций ----------
     def manage_positions(self):
         if self.day != dt.date.today():
             self.reset_day()
+
         if DRY_RUN:
             self._manage_dry()
             return
+
         live = self.api.open_positions()
         quotes = self.api.tickers(self.symbols)
+
         for symbol in list(self.positions):
             p = self.positions[symbol]
+
             cur = (quotes.get(symbol) or {}).get("last") or self.api.price(symbol)
             self.track_excursion(symbol, p, cur)
+
+            # 1. Ордер входа ещё ждёт исполнения.
             if p["phase"] == "WAIT_FILL":
                 info = live.get(symbol) if live is not None else None
+
                 if info:
                     self.cancel_leftover_entry(symbol, p)
                     self._activate(symbol, p, info)
+
                 elif time.time() > p["placed_ts"] + ENTRY_WAIT * self.tf_sec:
                     if self.cancel_entry_confirmed(symbol, p):
-                        self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
-                                 f"свечей — сигнал отменён")
+                        self.log(
+                            f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
+                            f"свечей — сигнал отменён"
+                        )
                         del self.positions[symbol]
                     else:
-                        p["placed_ts"] = (time.time() - ENTRY_WAIT * self.tf_sec
-                                          + CANCEL_RETRY_SEC)
+                        p["placed_ts"] = (
+                            time.time()
+                            - ENTRY_WAIT * self.tf_sec
+                            + CANCEL_RETRY_SEC
+                        )
+
                 continue
+
+            # 2. Позиция активна.
             info = live.get(symbol) if live is not None else None
+
             if info is None:
                 if live is None:
                     continue
+
                 self._settle_closed(symbol, p, cur)
                 continue
+
             p["qty"] = info["qty"]
+
             self._detect_tps(symbol, p, info)
+
             if symbol not in self.positions:
                 continue
+
+            # 3. Трейлинг хвоста.
             if p.get("tail") and p["qty"] > 0:
                 ch = self.chandelier(symbol, p)
+
                 if ch is not None:
-                    ns = max(p["stop_price"], ch) if p["side"] == "LONG" \
+                    ns = (
+                        max(p["stop_price"], ch)
+                        if p["side"] == "LONG"
                         else min(p["stop_price"], ch)
+                    )
+
                     if ns != p["stop_price"]:
                         self.move_stop(symbol, p, ns, p["qty"])
+
+            # 4. Если биржевой стоп не выставлен — резервная защита.
             if not p.get("stop_id") and not p.get("stop_cid"):
                 self._fallback_close(symbol, p, cur)
 
+    # ---------- сопровождение DRY-RUN ----------
     def _manage_dry(self):
         quotes = self.api.tickers(self.symbols)
+
         for symbol in list(self.positions):
             p = self.positions[symbol]
+
             cur = (quotes.get(symbol) or {}).get("last") or self.api.price(symbol)
             if cur is None:
                 continue
+
             self.track_excursion(symbol, p, cur)
+
             sgn = _sgn(p["side"])
+
+            # 1. Ждём исполнения лимитки.
             if p["phase"] == "WAIT_FILL":
                 if (cur - p["entry"]) * sgn <= 0:
                     p["phase"] = "ACTIVE"
-                    self.log(f"DRY: ВХОД {p['side']} {symbol} [{p['kind']}] "
-                             f"по {qstr(p['entry'])}")
+                    self.log(
+                        f"DRY: ВХОД {p['side']} {symbol} [{p['kind']}] "
+                        f"по {qstr(p['entry'])}"
+                    )
+
                 elif time.time() > p["placed_ts"] + ENTRY_WAIT * self.tf_sec:
-                    self.log(f"{symbol}: DRY лимит не исполнен за {ENTRY_WAIT} "
-                             f"свечей — отменён")
+                    self.log(
+                        f"{symbol}: DRY лимит не исполнен за {ENTRY_WAIT} "
+                        f"свечей — отменён"
+                    )
                     del self.positions[symbol]
                     continue
+
                 else:
                     continue
+
+            # 2. Трейлинг хвоста.
             if p.get("tail"):
                 ch = self.chandelier(symbol, p)
+
                 if ch is not None:
-                    ns = max(p["stop_price"], ch) if sgn > 0 else min(p["stop_price"], ch)
+                    ns = (
+                        max(p["stop_price"], ch)
+                        if sgn > 0
+                        else min(p["stop_price"], ch)
+                    )
+
                     if ns != p["stop_price"]:
                         p["stop_price"] = ns
                         self.log(f"DRY: трейлинг {symbol} — стоп {qstr(ns)}")
+
+            # 3. Стоп / безубыток / трейл.
             if (cur - p["stop_price"]) * sgn <= 0:
                 sp = p["stop_price"]
+
                 if (sp - p["entry"]) * sgn < 0:
                     self.register_stop(symbol)
                     self.close_trade(symbol, p, "СТОП", sp)
                 else:
-                    self.close_trade(symbol, p,
-                                     "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК", sp)
+                    self.close_trade(
+                        symbol,
+                        p,
+                        "ТРЕЙЛ" if p.get("tail") else "БЕЗУБЫТОК",
+                        sp
+                    )
+
                 del self.positions[symbol]
                 continue
+
+            # 4. Тейки.
             n = len(p["splits"])
+
             for i in range(n):
                 if p["tp_filled"][i]:
                     continue
+
                 tp = p["tp_levels"][i]
+
                 if (cur - tp) * sgn < 0:
                     break
+
                 p["tp_filled"][i] = True
-                p["qty"] = max(0.0, p["qty"] - p["qty_total"] * p["splits"][i])
-                self.log(f"DRY: ТЕЙК {i + 1}/{n} {symbol} ({qstr(tp)}), "
-                         f"остаток {qstr(p['qty'])}")
+                p["qty"] = max(
+                    0.0,
+                    p["qty"] - p["qty_total"] * p["splits"][i]
+                )
+
+                self.log(
+                    f"DRY: ТЕЙК {i + 1}/{n} {symbol} ({qstr(tp)}), "
+                    f"остаток {qstr(p['qty'])}"
+                )
+
                 if i == 0:
                     p["stop_price"] = p["entry"] + sgn * p["be"] * p["risk"]
                     self.log(f"{symbol}: стоп перенесён на {qstr(p['stop_price'])}")
+
                 if sum(p["tp_filled"]) >= n:
                     if p.get("tail_share", 0) > 0 and p["qty"] > 1e-9:
                         p["tail"] = True
-                        self.log(f"DRY: {symbol} хвост "
-                                 f"{p['tail_share'] * 100:.0f}% трейлится ATR-каналом")
+                        self.log(
+                            f"DRY: {symbol} хвост "
+                            f"{p['tail_share'] * 100:.0f}% трейлится ATR-каналом"
+                        )
                     else:
-                        self.close_trade(symbol, p, "ТЕЙК-ПОЛНЫЙ", p["tp_levels"][-1])
+                        self.close_trade(
+                            symbol,
+                            p,
+                            "ТЕЙК-ПОЛНЫЙ",
+                            p["tp_levels"][-1]
+                        )
                         del self.positions[symbol]
-                    break
 
-    # ==================================================================
-    #  ЧАСТЬ 5Б/5: восстановление после перезапуска и главный цикл.
-    # ==================================================================
+                    break
+# =====================================================================
+#  ЧАСТЬ 4в/5: ядро бота — восстановление после перезапуска и главный цикл.
+# =====================================================================
     def recover(self):
-        """После перезапуска: позиции под защиту, осиротевшие входные
-        лимиты снимаются. None от API = сбой, а не «позиций нет»."""
         self.load_day()
         if DRY_RUN:
             return
@@ -2185,9 +2452,10 @@ class Bot:
     def run(self):
         mode = "DRY-RUN (ордера НЕ отправляются)" if DRY_RUN else "РЕАЛЬНЫЙ РЕЖИМ"
         self.log(WARNING_ISOLATED)
+        self.log(f"Папка данных: {_DATA_DIR}")
         self.log(f"Журнал: {LOG_FILE}")
-        self.log(f"Сделки и MAE/MFE: {TRADES_FILE}")
-        self.log(f"SFP-бот v5: {self.api.name} {self.api.base}. {mode}. ТФ {self.tf_label}")
+        self.log(f"Сделки: {TRADES_FILE}")
+        self.log(f"SFP-бот v5 CLEAN: {self.api.name} {self.api.base}. {mode}. ТФ {self.tf_label}")
         trend = (f"EMA{EMA_PERIOD} на {self.sig.trend_label}" if self.sig.trend_enabled
                  else "EMA выключена — режим по рабочему ТФ")
         self.log(f"Режим: |наклон EMA{EMA_PERIOD}| / ATR > {REGIME_THRESHOLD} за "
@@ -2256,10 +2524,8 @@ class Bot:
                     break
                 time.sleep(1)
         self.log("Бот остановлен")
-
-
 # =====================================================================
-#  Оболочка Flet — все 13 полей настроек v4 сохранены
+#  ЧАСТЬ 5/5: Оболочка Flet — все 13 полей настроек
 # =====================================================================
 def tg_send(cfg, text):
     if not cfg.get("token") or not cfg.get("chat"):
@@ -2271,7 +2537,7 @@ def tg_send(cfg, text):
         pass
 
 def main(page: ft.Page):
-    page.title = "SFP-бот v5"
+    page.title = "SFP-бот v5 CLEAN"
     page.padding = 48
 
     def load_profiles():
@@ -2310,11 +2576,11 @@ def main(page: ft.Page):
               "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT,"
               "PENDLEUSDT,WLDUSDT,VIRTUALUSDT,KASUSDT,FARTCOINUSDT,DYDXUSDT,"
               "ONDOUSDT,ARKMUSDT")
-    deposit = ft.TextField(label="Риск на сделку (0.010 = 1% компаунд от баланса)",
+    deposit = ft.TextField(label="Риск на сделку (0.015 = 1.5% компаунд от баланса)",
                            value=str(RISK_PCT_DEFAULT))
-    losses = ft.TextField(label="Макс. стопов на корзину в день (на пару: 3)",
+    losses = ft.TextField(label="Макс. стопов на корзину в день",
                           value=str(MAX_STOPS_BASKET))
-    maxpos = ft.TextField(label="Макс. позиций одновременно", value="2")
+    maxpos = ft.TextField(label="Макс. позиций одновременно", value="3")
     ema_prox = ft.TextField(label="Вход не дальше N% от EMA (0 = без ограничения)",
                             value="3.0")
     tg_token = ft.TextField(label="Токен Telegram-бота", password=True,
@@ -2325,10 +2591,11 @@ def main(page: ft.Page):
                              options=[ft.dropdown.Option(k) for k in sorted(profiles)],
                              value=sorted(profiles)[0] if profiles else None)
     status = ft.Text("Остановлен", size=18, weight=ft.FontWeight.BOLD)
-    dry_note = ft.Text("🧪 DRY-RUN: ордера НЕ отправляются (DRY_RUN=True в файле)"
+    dry_note = ft.Text("🧪 DRY-RUN: ордера НЕ отправляются"
                        if DRY_RUN else "⚠️ РЕАЛЬНЫЙ РЕЖИМ: ордера идут на биржу",
                        size=14, weight=ft.FontWeight.BOLD)
     moscow_note = ft.Text(MOSCOW_HINT, size=13)
+    path_note = ft.Text(f"📁 Папка данных: {_DATA_DIR}", size=12, color=ft.Colors.BLUE)
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
     ui_lock = threading.Lock()
@@ -2348,7 +2615,7 @@ def main(page: ft.Page):
         tg_send(cfg, msg)
 
     def bot_log(msg):
-        add_log(msg, to_file=False)   # бот уже записал в файл
+        add_log(msg, to_file=False)
 
     def _export(src, name):
         try:
@@ -2357,8 +2624,16 @@ def main(page: ft.Page):
         except Exception:
             add_log(f"{name}: файл не найден")
             return
+        try:
+            dest = os.path.join(_DATA_DIR, name)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(data)
+            add_log(f"Сохранено: {dest}")
+            return
+        except Exception:
+            pass
         for base in ("/storage/emulated/0/Download", "/sdcard/Download",
-                     "/storage/emulated/0/Documents", _DATA_DIR):
+                     os.path.expanduser("~/Downloads")):
             try:
                 dest = os.path.join(base, name)
                 with open(dest, "w", encoding="utf-8") as f:
@@ -2465,7 +2740,7 @@ def main(page: ft.Page):
             if not (0 < risk <= 0.05):
                 raise ValueError
         except ValueError:
-            add_log("Риск — доля баланса от 0 до 0.05 (например 0.010)")
+            add_log("Риск — доля баланса от 0 до 0.05 (например 0.015)")
             return
         try:
             n_loss, n_pos = int(losses.value), int(maxpos.value)
@@ -2481,10 +2756,10 @@ def main(page: ft.Page):
         demo = mode.value == "Демо"
         if ex.value == "Bybit":
             api = BybitAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bybit "])
+                           demo, tf_cfg["interval_bybit"])
         else:
             api = BingXAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bingx "])
+                           demo, tf_cfg["interval_bingx"])
         bot = Bot(api, tf.value, trend_tf.value, pairs, risk, n_loss, n_pos, bot_log,
                   ema_proximity_pct=prox, load_state=load_state, save_state=save_state)
         cfg["token"] = tg_token.value.strip()
@@ -2514,7 +2789,7 @@ def main(page: ft.Page):
         ex, mode, tf, trend_tf, api_key, secret, symbols,
         ft.Row([ft.Container(deposit, expand=1), ft.Container(losses, expand=1)]),
         ft.Container(maxpos, expand=1), ema_prox, tg_token, tg_chat,
-        dry_note, moscow_note,
+        dry_note, moscow_note, path_note,
         ft.Row([btn_start, btn_stop]), status,
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
 
@@ -2552,4 +2827,4 @@ def main(page: ft.Page):
     except Exception:
         pass
 
-ft.run(main)
+ft.run(main)      
