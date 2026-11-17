@@ -61,6 +61,20 @@ def _pick_log_dir():
 LOG_DIR = _pick_log_dir()
 LOG_FILE = os.path.join(LOG_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(LOG_DIR, "sfp_trades.csv")
+_FALLBACK_LOG = os.path.join(_DATA_DIR, "sfp_log.txt")
+
+def _touch_file(path):
+    """Создаём файл сразу при старте процесса, чтобы кнопки Лог/Сделки
+    не показывали «файл не найден» до первого запуска бота."""
+    try:
+        if not os.path.exists(path):
+            with open(path, "a", encoding="utf-8"):
+                pass
+    except Exception:
+        pass
+
+_touch_file(LOG_FILE)
+_touch_file(TRADES_FILE)
 LOG_PATH_NOTE = (f"Журнал: {LOG_DIR}" if LOG_DIR != _DATA_DIR else
                  f"Журнал: {_DATA_DIR} — общие папки недоступны "
                  f"(нет разрешения на запись)")
@@ -186,16 +200,22 @@ def cluster_of(symbol):
 
 # ------------------- УТИЛИТЫ -------------------
 def log_to_file(text):
-    try:
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                data = f.read()
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.write(data[-LOG_MAX // 2:])
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
-    except Exception:
-        pass
+    line = f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n"
+    # Первая попытка — выбранная папка (Документы/Загрузки). Если запись не
+    # удалась (разрешение отняли, носитель недоступен) — дублируем в системную
+    # папку: журнал не теряется молча.
+    for path in (LOG_FILE, _FALLBACK_LOG):
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = f.read()
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(data[-LOG_MAX // 2:])
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            return
+        except Exception:
+            continue
 
 
 def dbg(text):
@@ -2517,11 +2537,18 @@ def main(page: ft.Page):
         add_log(msg, to_file=False)   # бот уже записал в файл
 
     def _export(src, name):
+        # Основного файла нет — ищем копию в системной папке: журнал мог
+        # уйти туда фолбэком при отказе записи в общие папки.
+        if not os.path.exists(src):
+            alt = os.path.join(_DATA_DIR, name)
+            if os.path.exists(alt):
+                src = alt
         try:
             with open(src, "r", encoding="utf-8") as f:
                 data = f.read()
         except Exception:
-            add_log(f"{name}: файл не найден")
+            add_log(f"{name}: файл ещё не создан — запустите бота и повторите "
+                    f"(искал: {src} и {os.path.join(_DATA_DIR, name)})")
             return
         for base in ("/storage/emulated/0/Documents", "/sdcard/Documents",
                      "/storage/emulated/0/Download", "/sdcard/Download",
