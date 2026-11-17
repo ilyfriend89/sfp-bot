@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
-# ======================================================================
+# =====================================================================
 #  SFP-бот v5  —  Bybit / BingX  —  оболочка Flet (настройки v4 сохранены)
 #  ЧАСТЬ 1/5: конфигурация, индикаторы, утилиты
-#
 #  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
 #  Размер позиции считает бот от риска; плечо задаёт только залог.
-#
 #  ФОРМАТ БАРА ВЕЗДЕ: (t_ms, open, high, low, close, volume)
 #  Сигналы считаются по ЗАКРЫТЫМ барам; последний элемент списка —
 #  ещё формирующаяся свеча и в расчёт сигналов не берётся.
-# ======================================================================
+# =====================================================================
 import os
 import csv
 import json
@@ -21,7 +19,6 @@ import threading
 import traceback
 import datetime as dt
 from decimal import Decimal, ROUND_DOWN
-
 import requests
 import flet as ft
 
@@ -38,32 +35,31 @@ STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 LOG_MAX = 200_000
-
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
 DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
 DRY_RUN_BALANCE = 1000.0
 
 # ------------------- ТАЙМФРЕЙМЫ (множители объёма SFP как в v4) -------------------
 TIMEFRAMES = {
-    "1 минута": {"interval_bybit": "1",   "interval_bingx": "1m",  "vol_mult": 3.0},
-    "5 минут":  {"interval_bybit": "5",   "interval_bingx": "5m",  "vol_mult": 2.8},
-    "15 минут": {"interval_bybit": "15",  "interval_bingx": "15m", "vol_mult": 1.5},
-    "30 минут": {"interval_bybit": "30",  "interval_bingx": "30m", "vol_mult": 2.2},
-    "1 час":    {"interval_bybit": "60",  "interval_bingx": "1h",  "vol_mult": 2.0},
-    "4 часа":   {"interval_bybit": "240", "interval_bingx": "4h",  "vol_mult": 1.5},
-    "1 день":   {"interval_bybit": "D",   "interval_bingx": "1d",  "vol_mult": 1.2},
+    "1 минута ": {"interval_bybit ": "1 ",    "interval_bingx ": "1m ",  "vol_mult ": 3.0},
+    "5 минут ":  {"interval_bybit ": "5 ",    "interval_bingx ": "5m ",  "vol_mult ": 2.8},
+    "15 минут ": {"interval_bybit ": "15 ",   "interval_bingx ": "15m ", "vol_mult ": 1.5},
+    "30 минут ": {"interval_bybit ": "30 ",   "interval_bingx ": "30m ", "vol_mult ": 2.2},
+    "1 час ":    {"interval_bybit ": "60 ",   "interval_bingx ": "1h ",  "vol_mult ": 2.0},
+    "4 часа ":   {"interval_bybit ": "240 ",  "interval_bingx ": "4h ",  "vol_mult ": 1.5},
+    "1 день ":   {"interval_bybit ": "D ",    "interval_bingx ": "1d ",  "vol_mult ": 1.2},
 }
-TF_MINUTES = {"1 минута": 1, "5 минут": 5, "15 минут": 15, "30 минут": 30,
-              "1 час": 60, "4 часа": 240, "1 день": 1440}
-TF_ORDER = ["1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "1 день"]
+TF_MINUTES = {"1 минута ": 1, "5 минут ": 5, "15 минут ": 15, "30 минут ": 30,
+              "1 час ": 60, "4 часа ": 240, "1 день ": 1440}
+TF_ORDER = ["1 минута ", "5 минут ", "15 минут ", "30 минут ", "1 час ", "4 часа ", "1 день "]
 
 BYBIT_ALIASES = {
-    "PEPEUSDT": "1000PEPEUSDT", "BONKUSDT": "1000BONKUSDT",
-    "FLOKIUSDT": "1000FLOKIUSDT", "SHIBUSDT": "1000SHIBUSDT",
-    "PUMPUSDT": "1000PUMPUSDT", "WLFIUSDT": "1000WLFIUSDT",
+    "PEPEUSDT ": "1000PEPEUSDT ", "BONKUSDT ": "1000BONKUSDT ",
+    "FLOKIUSDT ": "1000FLOKIUSDT ", "SHIBUSDT ": "1000SHIBUSDT ",
+    "PUMPUSDT ": "1000PUMPUSDT ", "WLFIUSDT ": "1000WLFIUSDT ",
 }
 BINGX_ALIASES = {
-    "PEPEUSDT": "1000PEPEUSDT", "PUMPUSDT": "1000PUMPUSDT",
+    "PEPEUSDT ": "1000PEPEUSDT ", "PUMPUSDT ": "1000PUMPUSDT ",
 }
 
 # ------------------- ИНДИКАТОРЫ / РЕЖИМ -------------------
@@ -92,13 +88,13 @@ TREND_BE_AFTER_TP1 = 0.0       # стоп в безубыток после ТП1
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
 RANGE_BE_AFTER_TP1 = -0.30     # стоп в -0.3R, НЕ полный безубыток
-RANGE_MIN_TP1_R = 1.2          # середина канала ближе -> пропуск
-RANGE_MIN_TP2_R = 2.5          # дальняя граница ближе -> пропуск
+RANGE_MIN_TP1_R = 1.0          # было 1.2 — чуть мягче
+RANGE_MIN_TP2_R = 2.0          # было 2.5 — чуть мягче
 RANGE_TARGET_FRAC = 0.90       # фронт-ранним дальнюю границу на 10%
 RANGE_MIN_WIDTH_R = 3.5        # ширина канала >= 3.5 x стоп
 RANGE_STOP_ATR = 0.6
-RANGE_ENTRY_RETRACE = 0.38     # вход на 38% отката сигнальной свечи
-RANGE_DAYS = 3
+RANGE_ENTRY_RETRACE = 0.20     # было 0.38 — вход ближе к границе, ключевой фикс
+RANGE_DAYS = 3                 # НЕ ТРОГАЕМ — 3 дня дают значимый канал
 RANGE_TOUCH_TOL = 0.0015
 RANGE_VOL_MULT = 1.3           # ТЕПЕРЬ РЕАЛЬНО ПРИМЕНЯЕТСЯ
 RANGE_MIN_TOUCHES = 2
@@ -151,25 +147,21 @@ CLUSTERS = {
     "OTHER": ("ZECUSDT", "HYPEUSDT", "XPLUSDT"),
 }
 _CLUSTER_MAP = {s: c for c, arr in CLUSTERS.items() for s in arr}
-
-
 def cluster_of(symbol):
     return _CLUSTER_MAP.get(symbol, "OTHER")
-
 
 # ------------------- УТИЛИТЫ -------------------
 def log_to_file(text):
     try:
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
+            with open(LOG_FILE, "r ", encoding="utf-8 ") as f:
                 data = f.read()
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
+            with open(LOG_FILE, "w ", encoding="utf-8 ") as f:
                 f.write(data[-LOG_MAX // 2:])
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
+        with open(LOG_FILE, "a ", encoding="utf-8 ") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n ")
     except Exception:
         pass
-
 
 def dbg(text):
     if DEBUG_API:
@@ -178,7 +170,6 @@ def dbg(text):
         except Exception:
             pass
 
-
 def state_load():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -186,14 +177,12 @@ def state_load():
     except Exception:
         return {}
 
-
 def state_save(data):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception:
         pass
-
 
 def round_step(value, step):
     try:
@@ -205,25 +194,20 @@ def round_step(value, step):
     except Exception:
         return value
 
-
 def qstr(x):
     s = f"{float(x):.10f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
-
 def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
-
 
 def _sgn(side):
     """Направление сделки: +1 для LONG, -1 для SHORT.
     ВАЖНО: функция уровня модуля, она НЕ метод класса Bot."""
     return 1 if side == "LONG" else -1
 
-
 def new_client_id(prefix="sfp"):
     return f"{prefix}{int(time.time() * 1000)}"
-
 
 def extract_order_id(res):
     """orderId из любого формата ответа: dict / вложенность / список / скаляр."""
@@ -239,39 +223,32 @@ def extract_order_id(res):
                 return v
         return None
     if isinstance(res, dict):
-        for k in ("orderId", "order_id", "orderID", "id"):
+        for k in ("orderId ", "order_id ", "orderID ", "id "):
             v = res.get(k)
             if isinstance(v, (str, int)) and str(v).strip():
                 return str(v).strip()
-        for k in ("order", "data", "result"):
+        for k in ("order ", "data ", "result "):
             v = extract_order_id(res.get(k))
             if v:
                 return v
     return None
 
-
 def is_reduce(o):
     return o.get("reduceOnly") in (True, "true", "True", 1, "1")
-
 
 def order_ids(o):
     oid = o.get("orderId") or o.get("id") or ""
     cid = o.get("clientOrderId") or o.get("orderLinkId") or ""
     return str(oid), str(cid)
 
-
 DEAD_STATUSES = ("filled", "cancelled", "canceled", "rejected",
                  "expired", "deactivated", "failed")
-
-
 def order_alive(o):
     st = str(o.get("status") or o.get("orderStatus") or "").lower()
     return st not in DEAD_STATUSES
 
-
 def tf_ms(label):
     return TF_MINUTES[label] * 60 * 1000
-
 
 # ------------------- ИНДИКАТОРЫ -------------------
 def true_ranges(bars):
@@ -280,7 +257,6 @@ def true_ranges(bars):
         h, l, pc = bars[i][2], bars[i][3], bars[i - 1][4]
         out.append(max(h - l, abs(h - pc), abs(l - pc)))
     return out
-
 
 def atr_last(bars, period=ATR_PERIOD):
     """ATR Уайлдера по закрытым барам. bars: (t,o,h,l,c,v)."""
@@ -292,7 +268,6 @@ def atr_last(bars, period=ATR_PERIOD):
         a = (a * (period - 1) + x) / period
     return a
 
-
 def ema(values, period):
     """EMA с сидом SMA первых period значений (как в v4)."""
     if len(values) < period:
@@ -302,7 +277,6 @@ def ema(values, period):
     for v in values[period:]:
         e = v * k + e * (1 - k)
     return e
-
 
 def ema_series(values, n):
     if len(values) < n:
@@ -314,19 +288,16 @@ def ema_series(values, n):
         out.append(e)
     return out
 
-
 def calc_tps(entry, risk, side, offsets):
     """Тейки по смещениям в R от НЕИЗМЕННОГО исходного риска."""
     if side == "LONG":
         return [entry + o * risk for o in offsets]
     return [entry - o * risk for o in offsets]
 
-
 def cost_floor_frac(spread):
     """Минимальная дистанция стопа (доля цены), чтобы издержки <= 0.10R."""
     sp = spread if (spread and spread > 0) else 0.0002
     return COST_STOP_MULT * (FEE_MAKER + FEE_TAKER + sp)
-
 
 def cost_ratio(stop_frac, spread):
     """Издержки в долях R — ключевая метрика качества сетапа."""
@@ -335,36 +306,31 @@ def cost_ratio(stop_frac, spread):
     sp = spread if (spread and spread > 0) else 0.0002
     return (FEE_MAKER + FEE_TAKER + sp) / stop_frac
 
-
 def score_signal(f):
     """Скоринг сетапа. Признаки нормированы в [0,1].
     Веса — априорные; подлежат проверке на истории, не догма."""
-    s = (SCORE_W_VOL * clamp(f.get("vol_z", 0.0))
-         + SCORE_W_DEPTH * clamp(f.get("depth", 0.0))
-         + SCORE_W_ROOM * clamp(f.get("room", 0.0))
-         + SCORE_W_ALIGN * clamp(f.get("align", 0.0))
-         - SCORE_W_COST * clamp(f.get("cost", 0.0)))
-    if f.get("confluence"):
+    s = (SCORE_W_VOL * clamp(f.get("vol_z ", 0.0))
+         + SCORE_W_DEPTH * clamp(f.get("depth ", 0.0))
+         + SCORE_W_ROOM * clamp(f.get("room ", 0.0))
+         + SCORE_W_ALIGN * clamp(f.get("align ", 0.0))
+         - SCORE_W_COST * clamp(f.get("cost ", 0.0)))
+    if f.get("confluence "):
         s += SCORE_CONFLUENCE
     return s
-
 
 MOSCOW_HINT = ("⏰ v5: торговля 24/7. Лимит входа ждёт 3 свечи. "
                "Сигналы отбираются по скорингу всей корзины, а не по порядку списка.")
 
-
-# ======================================================================
+# =====================================================================
 #  ЧАСТЬ 2/5: API-слой. Единый интерфейс для Bybit и BingX.
 #  Возврат свечей: (t_ms, open, high, low, close, volume), по возрастанию t.
 #  ВАЖНО: open_positions() -> None означает СБОЙ ЗАПРОСА, а не «позиций нет».
-# ======================================================================
-PUBLIC_OK_PATHS = ("/v5/market/", "/openApi/swap/v2/quote/", "/openApi/swap/v3/quote/")
-RATE_HINTS = ("too many", "rate", "429", "稍后", "retry", "frequent", "limit")
-
+# =====================================================================
+PUBLIC_OK_PATHS = ("/v5/market/ ", "/openApi/swap/v2/quote/ ", "/openApi/swap/v3/quote/ ")
+RATE_HINTS = ("too many ", "rate ", "429 ", "稍后 ", "retry ", "frequent ", "limit ")
 
 def _is_public(path):
     return any(path.startswith(p) for p in PUBLIC_OK_PATHS)
-
 
 def _f(x, default=0.0):
     try:
@@ -373,7 +339,6 @@ def _f(x, default=0.0):
         return float(x)
     except Exception:
         return default
-
 
 class BybitAPI:
     def __init__(self, api_key, secret, demo, interval):
@@ -391,7 +356,6 @@ class BybitAPI:
     # ---------- символы ----------
     def sym(self, s):
         return self.aliases.get(s, s)
-
     def to_universal(self, s):
         return self.reverse.get(s, s.replace("-", ""))
 
@@ -727,10 +691,8 @@ class BingXAPI:
     # ---------- символы ----------
     def sym(self, s):
         return self.aliases.get(s, s)
-
     def to_universal(self, s):
         return self.reverse.get(s, s.replace("-", ""))
-
     def fmt(self, symbol):
         s = self.sym(symbol)
         for q in ("USDT", "USDC", "BTC"):
@@ -1081,21 +1043,21 @@ class BingXAPI:
         return res
 
 
-# ======================================================================
+# =====================================================================
 #  ЧАСТЬ 3/5: режим рынка и генераторы сигналов.
 #  Сигнал — словарь; конфликты одной пары разрешаются в resolve().
 #  Отбор между парами (скоринг + портфельные лимиты) — в части 4.
-# ======================================================================
+# =====================================================================
 class Signals:
     def __init__(self, api, tf_label, trend_label, ema_prox_pct, log):
         self.api = api
         self.tf_label = tf_label
-        self.vol_mult = TIMEFRAMES[tf_label]["vol_mult"]
+        self.vol_mult = TIMEFRAMES[tf_label]["vol_mult "]
         self.trend_enabled = (trend_label != EMA_OFF)
         self.trend_label = trend_label
         self.ema_prox = ema_prox_pct
         self.log = log
-        key = ("interval_bybit" if api.name == "Bybit" else "interval_bingx")
+        key = ("interval_bybit " if api.name == "Bybit" else "interval_bingx ")
         self.trend_interval = TIMEFRAMES[trend_label][key] if self.trend_enabled else None
         self.range_bars = max(30, RANGE_DAYS * 1440 // TF_MINUTES[tf_label])
         self._ctx = {}
@@ -1228,7 +1190,7 @@ class Signals:
             return None                              # против сильного тренда не торгуем
         if d < 0 and side == "LONG":
             return None
-        # вход на 38% отката сигнальной свечи, а не на самом экстремуме
+        # вход на 20% отката сигнальной свечи, а не на самом экстремуме
         rng = max(last[2] - last[3], atr * 0.1)
         entry = last[4] + RANGE_ENTRY_RETRACE * rng if side == "SHORT" else \
             last[4] - RANGE_ENTRY_RETRACE * rng
@@ -1389,12 +1351,12 @@ class Signals:
         return self.resolve(symbol, ctx)
 
 
-# ======================================================================
+# =====================================================================
 #  ЧАСТЬ 4/5 + 5/5: ядро бота — состояние, лимиты, отбор сигналов,
 #  учёт сделок, исполнение ордеров и сопровождение позиций.
 #  В позиции НЕИЗМЕННЫ: entry, risk, stop0, qty_total, tp_levels, splits.
 #  Меняются только: stop_price, qty, tp_filled, tail, mae, mfe.
-# ======================================================================
+# =====================================================================
 class Bot:
     def __init__(self, api, tf_label, trend_label, symbols, risk_pct,
                  max_losses_per_day, max_positions, log,
@@ -2296,9 +2258,9 @@ class Bot:
         self.log("Бот остановлен")
 
 
-# ======================================================================
+# =====================================================================
 #  Оболочка Flet — все 13 полей настроек v4 сохранены
-# ======================================================================
+# =====================================================================
 def tg_send(cfg, text):
     if not cfg.get("token") or not cfg.get("chat"):
         return
@@ -2308,24 +2270,20 @@ def tg_send(cfg, text):
     except Exception:
         pass
 
-
 def main(page: ft.Page):
     page.title = "SFP-бот v5"
     page.padding = 48
 
     def load_profiles():
         return state_load().get("profiles") or {}
-
     def save_profiles(p):
         d = state_load()
         d["profiles"] = p
         state_save(d)
-
     profiles = load_profiles()
 
     def load_state():
         return state_load().get("losses")
-
     def save_state(data):
         d = state_load()
         d["losses"] = data
@@ -2374,7 +2332,6 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=5, auto_scroll=True, expand=True)
     cfg = {"token": "", "chat": ""}
     ui_lock = threading.Lock()
-
     warning_banner = ft.Container(
         content=ft.Text(WARNING_ISOLATED, color=ft.Colors.BLACK,
                         weight=ft.FontWeight.BOLD),
@@ -2419,7 +2376,6 @@ def main(page: ft.Page):
 
     def collect():
         return {k: (f.value or "") for k, f in FIELDS.items()}
-
     def apply(data):
         for k, f in FIELDS.items():
             f.value = data.get(k, "")
@@ -2467,6 +2423,7 @@ def main(page: ft.Page):
         add_log(f"Профиль «{name}» удалён")
 
     profile_dd.on_change = on_load
+
     state = {"bot": None, "thread": None, "active": False}
 
     def set_buttons(running):
@@ -2524,10 +2481,10 @@ def main(page: ft.Page):
         demo = mode.value == "Демо"
         if ex.value == "Bybit":
             api = BybitAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bybit"])
+                           demo, tf_cfg["interval_bybit "])
         else:
             api = BingXAPI(api_key.value.strip(), secret.value.strip(),
-                           demo, tf_cfg["interval_bingx"])
+                           demo, tf_cfg["interval_bingx "])
         bot = Bot(api, tf.value, trend_tf.value, pairs, risk, n_loss, n_pos, bot_log,
                   ema_proximity_pct=prox, load_state=load_state, save_state=save_state)
         cfg["token"] = tg_token.value.strip()
@@ -2586,6 +2543,7 @@ def main(page: ft.Page):
     page.add(ft.Column([warning_banner,
                         ft.Row([btn_tab_settings, btn_tab_log]), content],
                        spacing=10, expand=True))
+
     try:
         last = state_load().get("last_profile")
         if last and last in profiles:
@@ -2593,6 +2551,5 @@ def main(page: ft.Page):
             refresh_dd(last)
     except Exception:
         pass
-
 
 ft.run(main)
