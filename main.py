@@ -61,24 +61,43 @@ def _pick_log_dir():
 LOG_DIR = _pick_log_dir()
 LOG_FILE = os.path.join(LOG_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(LOG_DIR, "sfp_trades.csv")
-_FALLBACK_LOG = os.path.join(_DATA_DIR, "sfp_log.txt")
-
-def _touch_file(path):
-    """Создаём файл сразу при старте процесса, чтобы кнопки Лог/Сделки
-    не показывали «файл не найден» до первого запуска бота."""
-    try:
-        if not os.path.exists(path):
-            with open(path, "a", encoding="utf-8"):
-                pass
-    except Exception:
-        pass
-
-_touch_file(LOG_FILE)
-_touch_file(TRADES_FILE)
-LOG_PATH_NOTE = (f"Журнал: {LOG_DIR}" if LOG_DIR != _DATA_DIR else
-                 f"Журнал: {_DATA_DIR} — общие папки недоступны "
-                 f"(нет разрешения на запись)")
+# Запасные копии — всегда в системной папке приложения, она доступна безусловно
+LOG_FALLBACK_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
+TRADES_FALLBACK_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 LOG_MAX = 200_000
+
+# Ошибки записи журнала НЕ глотаются: собираются и показываются при старте
+_LOG_ERRORS = []
+_LOG_PRIM_OK = False
+
+def _create_log_files():
+    """Файлы журнала и сделок создаются при старте процесса, а не первой записью."""
+    global _LOG_PRIM_OK
+    try:
+        if not os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write("")
+        _LOG_PRIM_OK = True
+    except Exception as e:
+        _LOG_ERRORS.append(f"{LOG_FILE}: {type(e).__name__}: {e}")
+    for path in (LOG_FALLBACK_FILE, TRADES_FILE, TRADES_FALLBACK_FILE):
+        try:
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception as e:
+            _LOG_ERRORS.append(f"{path}: {type(e).__name__}: {e}")
+
+_create_log_files()
+
+if _LOG_PRIM_OK:
+    LOG_PATH_NOTE = f"Журнал: {LOG_FILE} (создан при старте)"
+elif os.path.exists(LOG_FALLBACK_FILE):
+    LOG_PATH_NOTE = (f"Журнал: {LOG_FALLBACK_FILE} — общая папка не приняла файл "
+                     f"({_LOG_ERRORS[0] if _LOG_ERRORS else 'запись отклонена'})")
+else:
+    LOG_PATH_NOTE = ("Журнал: ЗАПИСЬ НЕВОЗМОЖНА НИКУДА — " +
+                     ("; ".join(_LOG_ERRORS) or "нет прав на запись"))
 
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
 DRY_RUN = False          # ПЕРВЫЙ ПРОГОН БЕЗ ОРДЕРОВ. Для реала -> False
@@ -199,23 +218,36 @@ def cluster_of(symbol):
 
 
 # ------------------- УТИЛИТЫ -------------------
+def _log_write(path, text):
+    if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data[-LOG_MAX // 2:])
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
+
 def log_to_file(text):
-    line = f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n"
-    # Первая попытка — выбранная папка (Документы/Загрузки). Если запись не
-    # удалась (разрешение отняли, носитель недоступен) — дублируем в системную
-    # папку: журнал не теряется молча.
-    for path in (LOG_FILE, _FALLBACK_LOG):
-        try:
-            if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = f.read()
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(data[-LOG_MAX // 2:])
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
-            return
-        except Exception:
-            continue
+    try:
+        _log_write(LOG_FILE, text)
+        return
+    except Exception as e:
+        msg = (f"основной журнал недоступен ({type(e).__name__}: {e}) — "
+               f"пишу в {LOG_FALLBACK_FILE}")
+        if msg not in _LOG_ERRORS:
+            _LOG_ERRORS.append(msg)
+    try:
+        _log_write(LOG_FALLBACK_FILE, text)
+        return
+    except Exception as e:
+        msg2 = f"журнал не записан нигде ({type(e).__name__}: {e})"
+        if msg2 not in _LOG_ERRORS:
+            _LOG_ERRORS.append(msg2)
+
+
+log_to_file(f"=== файл журнала создан при старте: {LOG_FILE} ===")
+if _LOG_ERRORS:
+    LOG_PATH_NOTE += " | ВНИМАНИЕ: " + _LOG_ERRORS[0]
 
 
 def dbg(text):
@@ -1663,8 +1695,12 @@ class Bot:
 
     def _csv_trade(self, symbol, p, category, cur, r_gross, r_net, usdt, fees):
         try:
-            new = not os.path.exists(TRADES_FILE)
-            with open(TRADES_FILE, "a", newline="", encoding="utf-8") as f:
+            try:
+                f = open(TRADES_FILE, "a", newline="", encoding="utf-8")
+            except Exception:
+                f = open(TRADES_FALLBACK_FILE, "a", newline="", encoding="utf-8")
+            new = f.tell() == 0
+            with f:
                 w = csv.writer(f)
                 if new:
                     w.writerow(["ts", "symbol", "kind", "side", "entry", "stop0",
@@ -2525,9 +2561,18 @@ def main(page: ft.Page):
     btn_start = ft.FilledButton("Запустить", expand=True)
     btn_stop = ft.FilledButton("Остановить", expand=True, disabled=True)
 
+    _err_seen = [0]
+
     def add_log(msg, to_file=True):
         if to_file:
             log_to_file(msg)
+        if len(_LOG_ERRORS) > _err_seen[0]:
+            _err_seen[0] = len(_LOG_ERRORS)
+            with ui_lock:
+                log_view.controls.append(ft.Text(
+                    f"{dt.datetime.now():%H:%M:%S}  ⚠ ЖУРНАЛ: {_LOG_ERRORS[-1]}",
+                    color=ft.Colors.ORANGE))
+                page.update()
         with ui_lock:
             log_view.controls.append(ft.Text(f"{dt.datetime.now():%H:%M:%S}  {msg}"))
             page.update()
@@ -2537,18 +2582,24 @@ def main(page: ft.Page):
         add_log(msg, to_file=False)   # бот уже записал в файл
 
     def _export(src, name):
-        # Основного файла нет — ищем копию в системной папке: журнал мог
-        # уйти туда фолбэком при отказе записи в общие папки.
-        if not os.path.exists(src):
-            alt = os.path.join(_DATA_DIR, name)
-            if os.path.exists(alt):
-                src = alt
-        try:
-            with open(src, "r", encoding="utf-8") as f:
-                data = f.read()
-        except Exception:
+        data = None
+        for path in (src, os.path.join(_DATA_DIR, name)):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = f.read()
+                break
+            except Exception:
+                continue
+        if data is None:
             add_log(f"{name}: файл ещё не создан — запустите бота и повторите "
                     f"(искал: {src} и {os.path.join(_DATA_DIR, name)})")
+            return
+        if data == "":
+            what = ("бот ещё не начал писать" if name.endswith(".txt")
+                    else "закрытых сделок пока нет")
+            extra = (f"; ошибки записи: {'; '.join(_LOG_ERRORS)}"
+                     if _LOG_ERRORS and name.endswith(".txt") else "")
+            add_log(f"{name}: файл создан при старте, но пуст — {what}{extra}")
             return
         for base in ("/storage/emulated/0/Documents", "/sdcard/Documents",
                      "/storage/emulated/0/Download", "/sdcard/Download",
