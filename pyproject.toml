@@ -3,7 +3,7 @@ name = "sfp-bot"
 version = "1.1.0"
 description = "SFP bot for BingX"
 dependencies = [
-    "flet>=0.28.0",
+    "flet==1.1.2",
     "requests>=2.31.0",
 ]
 
@@ -12,7 +12,7 @@ org = "com.sfpbot.app"
 product = "ByBing Bot"
 
 [tool.flet.android]
-min_sdk_version = 26    # FOREGROUND_SERVICE: с API 26+, POST_NOTIFICATIONS — с 33 (право просто игнорируется ниже)
+min_sdk_version = 26
 
 [tool.flet.android.permission]
 "android.permission.INTERNET" = true
