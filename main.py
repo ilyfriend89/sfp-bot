@@ -35,8 +35,35 @@ BINGX_DEMO = "https://open-api-vst.bingx.com"
 
 _DATA_DIR = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
-LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
-TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
+
+def _writable_dir(path):
+    """True, если папку можно создать и писать в неё."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        t = os.path.join(path, ".sfp_wtest")
+        with open(t, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(t)
+        return True
+    except Exception:
+        return False
+
+def _pick_log_dir():
+    # Журнал и сделки: Документы -> Загрузки -> системная папка.
+    # sfp_state.json всегда в _DATA_DIR, чтобы состояние дня не обнулялось.
+    for cand in ("/storage/emulated/0/Documents", "/sdcard/Documents",
+                 "/storage/emulated/0/Download", "/sdcard/Download",
+                 _DATA_DIR):
+        if _writable_dir(cand):
+            return cand
+    return _DATA_DIR
+
+LOG_DIR = _pick_log_dir()
+LOG_FILE = os.path.join(LOG_DIR, "sfp_log.txt")
+TRADES_FILE = os.path.join(LOG_DIR, "sfp_trades.csv")
+LOG_PATH_NOTE = (f"Журнал: {LOG_DIR}" if LOG_DIR != _DATA_DIR else
+                 f"Журнал: {_DATA_DIR} — общие папки недоступны "
+                 f"(нет разрешения на запись)")
 LOG_MAX = 200_000
 
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
@@ -619,6 +646,11 @@ class BybitAPI:
                 continue
             for o in (d or {}).get("list", []):
                 if isinstance(o, dict):
+                    sym_o = str(o.get("symbol") or "")
+                    if sym_o and sym_o != self.sym(symbol):
+                        dbg(f"Bybit openOrders: чужой символ {sym_o} при "
+                            f"запросе {self.sym(symbol)} — отброшено")
+                        continue
                     out.append(o)
         return out if ok else None
 
@@ -990,7 +1022,18 @@ class BingXAPI:
         except Exception as ex:
             self.last_error = str(ex)
             return None
-        return [o for o in self._unwrap(d) if isinstance(o, dict)]
+        want = self.fmt(symbol)
+        res = []
+        for o in self._unwrap(d):
+            if not isinstance(o, dict):
+                continue
+            sym_o = str(o.get("symbol") or "")
+            if sym_o and sym_o != want:
+                dbg(f"BingX openOrders: чужой символ {sym_o} при запросе "
+                    f"{want} — отброшено")
+                continue
+            res.append(o)
+        return res
 
     def open_reduce_orders(self, symbol):
         res = []
@@ -1738,6 +1781,23 @@ class Bot:
         except Exception:
             return None
 
+    def _entry_gone(self, symbol):
+        """True: входного ордера на бирже больше нет и позиции тоже нет —
+        ордер снят вручную или отозван биржей. Сбой API (None) -> False."""
+        try:
+            left = self.api.open_entry_orders(symbol)
+        except Exception:
+            return False
+        if left is None or left:
+            return False
+        try:
+            live = self.api.open_positions()
+        except Exception:
+            return False
+        if live is None or symbol in live:
+            return False
+        return True
+
     def orphan_sweep(self):
         """Повтор отмены висящих входных лимитов до подтверждения снятия."""
         if DRY_RUN or not self._orphans:
@@ -2104,6 +2164,13 @@ class Bot:
                 if info:
                     self.cancel_leftover_entry(symbol, p)
                     self._activate(symbol, p, info)
+                elif (not DRY_RUN
+                      and time.time() - p.get("_gone_chk", 0) >= 30
+                      and self._entry_gone(symbol)):
+                    p["_gone_chk"] = time.time()
+                    self.log(f"{symbol}: входной ордер исчез с биржи "
+                             f"(снят вручную?) — слот освобождён")
+                    del self.positions[symbol]
                 elif time.time() > p["placed_ts"] + ENTRY_WAIT * self.tf_sec:
                     if self.cancel_entry_confirmed(symbol, p):
                         self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
@@ -2307,6 +2374,7 @@ class Bot:
                  f"{'вкл' if PREEMPT_ENABLED else 'выкл'} (порог x{PREEMPT_SCORE_RATIO}). "
                  f"Позиции каждые {FAST_PERIOD}с, сигналы на закрытии бара")
         self.log(MOSCOW_HINT)
+        self.log(LOG_PATH_NOTE)
         if DRY_RUN:
             self.equity = self.dry_balance
             self.log(f"DRY-RUN: расчётный баланс {self.dry_balance:.0f} USDT")
@@ -2455,13 +2523,18 @@ def main(page: ft.Page):
         except Exception:
             add_log(f"{name}: файл не найден")
             return
-        for base in ("/storage/emulated/0/Download", "/sdcard/Download",
-                     "/storage/emulated/0/Documents", _DATA_DIR):
+        for base in ("/storage/emulated/0/Documents", "/sdcard/Documents",
+                     "/storage/emulated/0/Download", "/sdcard/Download",
+                     _DATA_DIR):
             try:
                 dest = os.path.join(base, name)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(data)
-                add_log(f"Сохранено: {dest}")
+                if base == _DATA_DIR:
+                    add_log(f"{name}: общие папки недоступны (нет разрешения "
+                            f"на запись) — сохранено в системную: {dest}")
+                else:
+                    add_log(f"Сохранено: {dest}")
                 return
             except Exception:
                 continue
