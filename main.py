@@ -35,57 +35,8 @@ BINGX_DEMO = "https://open-api-vst.bingx.com"
 
 _DATA_DIR = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
-
-def _writable_dir(path):
-    """True, если папку можно создать и писать в неё."""
-    try:
-        os.makedirs(path, exist_ok=True)
-        t = os.path.join(path, ".sfp_wtest")
-        with open(t, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(t)
-        return True
-    except Exception:
-        return False
-
-def _pick_log_dir():
-    # Журнал и сделки: Документы -> Загрузки -> системная папка.
-    # sfp_state.json всегда в _DATA_DIR, чтобы состояние дня не обнулялось.
-    for cand in ("/storage/emulated/0/Documents", "/sdcard/Documents",
-                 "/storage/emulated/0/Download", "/sdcard/Download",
-                 _DATA_DIR):
-        if _writable_dir(cand):
-            return cand
-    return _DATA_DIR
-
-LOG_DIR = _pick_log_dir()
-LOG_FILE = os.path.join(LOG_DIR, "sfp_log.txt")
-TRADES_FILE = os.path.join(LOG_DIR, "sfp_trades.csv")
-SYS_LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
-SYS_TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
-
-
-def _init_log_files():
-    """Файлы создаются при загрузке модуля, а не первой записью:
-    кнопки 'Лог'/'Сделки' никогда не встречают пустоту."""
-    for path in (LOG_FILE, TRADES_FILE):
-        try:
-            if not os.path.exists(path):
-                with open(path, "w", encoding="utf-8"):
-                    pass
-        except Exception:
-            pass
-    try:  # пробная запись — сбой виден сразу, а не молча
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | === файл создан при старте: {LOG_FILE} ===\n")
-    except Exception:
-        pass
-
-
-_init_log_files()
-LOG_PATH_NOTE = (f"Журнал: {LOG_DIR}" if LOG_DIR != _DATA_DIR else
-                 f"Журнал: {_DATA_DIR} — общие папки недоступны "
-                 f"(нет разрешения на запись)")
+LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
+TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
 LOG_MAX = 200_000
 
 DEBUG_API = True        # сырые ответы биржи по ордерам -> в файл журнала
@@ -112,7 +63,7 @@ BYBIT_ALIASES = {
     "PUMPUSDT": "1000PUMPUSDT", "WLFIUSDT": "1000WLFIUSDT",
 }
 BINGX_ALIASES = {
-    "PEPEUSDT": "1000PEPEUSDT",
+    "PEPEUSDT": "1000PEPEUSDT", "PUMPUSDT": "1000PUMPUSDT",
 }
 
 # ------------------- ИНДИКАТОРЫ / РЕЖИМ -------------------
@@ -146,7 +97,7 @@ RANGE_MIN_TP2_R = 2.5          # дальняя граница ближе -> п�
 RANGE_TARGET_FRAC = 0.90       # фронт-ранним дальнюю границу на 10%
 RANGE_MIN_WIDTH_R = 3.5        # ширина канала >= 3.5 x стоп
 RANGE_STOP_ATR = 0.6
-RANGE_ENTRY_RETRACE = 0.25     # вход на 25% отката сигнальной свечи (вариант 1)
+RANGE_ENTRY_RETRACE = 0.38     # вход на 38% отката сигнальной свечи
 RANGE_DAYS = 3
 RANGE_TOUCH_TOL = 0.0015
 RANGE_VOL_MULT = 1.3           # ТЕПЕРЬ РЕАЛЬНО ПРИМЕНЯЕТСЯ
@@ -158,10 +109,6 @@ CHOCH_SWING = 60               # TREND-B: мажорный свинг
 CHOCH_MINOR = 10               # минорный свинг для слома структуры
 CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70      # размер против режима
-
-# --- ВАРИАНТ 1: РАННИЙ ВХОД (сдвиг лимита к рынку) ---
-TREND_A_ENTRY_OFF = 0.30       # вход на 0.3 ATR ближе к рынку от уровня свинга
-TREND_B_ENTRY_OFF = 0.20       # вход на 0.2 ATR ближе от сломанного минорного уровня
 
 # ------------------- РИСК / ЛИМИТЫ -------------------
 RISK_PCT_DEFAULT = 0.010       # 1% на период валидации (в поле можно 0.015)
@@ -195,12 +142,12 @@ CLUSTERS = {
     "LARGE": ("SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT",
               "LINKUSDT", "LTCUSDT", "BCHUSDT", "ETCUSDT", "ATOMUSDT", "XLMUSDT",
               "HBARUSDT", "ALGOUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "NEARUSDT",
-              "APTUSDT", "SUIUSDT", "TRXUSDT", "POLUSDT", "UNIUSDT", "AAVEUSDT", "KASUSDT"),
+              "APTUSDT", "SUIUSDT", "TRXUSDT", "POLUSDT", "UNIUSDT", "AAVEUSDT"),
     "MEME": ("DOGEUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
              "SHIBUSDT", "JUPUSDT", "TIAUSDT", "SEIUSDT", "INJUSDT", "ENAUSDT",
-             "PUMPUSDT", "WLFIUSDT", "SUSDT", "ASTERUSDT", "NIGHTUSDT", "FARTCOINUSDT"),
-    "AI": ("FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT", "WLDUSDT", "VIRTUALUSDT", "ARKMUSDT"),
-    "DEFI": ("CRVUSDT", "LDOUSDT", "ARBUSDT", "OPUSDT", "PENDLEUSDT", "DYDXUSDT", "ONDOUSDT"),
+             "PUMPUSDT", "WLFIUSDT", "SUSDT", "ASTERUSDT", "NIGHTUSDT"),
+    "AI": ("FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT"),
+    "DEFI": ("CRVUSDT", "LDOUSDT", "ARBUSDT", "OPUSDT"),
     "OTHER": ("ZECUSDT", "HYPEUSDT", "XPLUSDT"),
 }
 _CLUSTER_MAP = {s: c for c, arr in CLUSTERS.items() for s in arr}
@@ -212,7 +159,6 @@ def cluster_of(symbol):
 
 # ------------------- УТИЛИТЫ -------------------
 def log_to_file(text):
-    line = f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n"
     try:
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
             with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -220,13 +166,7 @@ def log_to_file(text):
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(data[-LOG_MAX // 2:])
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-        return
-    except Exception:
-        pass
-    try:  # основная папка отвалилась — ничего не теряем
-        with open(SYS_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
     except Exception:
         pass
 
@@ -679,11 +619,6 @@ class BybitAPI:
                 continue
             for o in (d or {}).get("list", []):
                 if isinstance(o, dict):
-                    sym_o = str(o.get("symbol") or "")
-                    if sym_o and sym_o != self.sym(symbol):
-                        dbg(f"Bybit openOrders: чужой символ {sym_o} при "
-                            f"запросе {self.sym(symbol)} — отброшено")
-                        continue
                     out.append(o)
         return out if ok else None
 
@@ -1055,18 +990,7 @@ class BingXAPI:
         except Exception as ex:
             self.last_error = str(ex)
             return None
-        want = self.fmt(symbol)
-        res = []
-        for o in self._unwrap(d):
-            if not isinstance(o, dict):
-                continue
-            sym_o = str(o.get("symbol") or "")
-            if sym_o and sym_o != want:
-                dbg(f"BingX openOrders: чужой символ {sym_o} при запросе "
-                    f"{want} — отброшено")
-                continue
-            res.append(o)
-        return res
+        return [o for o in self._unwrap(d) if isinstance(o, dict)]
 
     def open_reduce_orders(self, symbol):
         res = []
@@ -1356,12 +1280,7 @@ class Signals:
         if not (long_ok or short_ok):
             return None
         side = "LONG" if long_ok else "SHORT"
-        off = TREND_A_ENTRY_OFF * atr
-        entry = sw_lo + off if side == "LONG" else sw_hi - off
-        # защита: сдвинутая цена за рынком -> откат к классическому уровню
-        if (side == "LONG" and entry >= last[4]) or \
-           (side == "SHORT" and entry <= last[4]):
-            entry = sw_lo if side == "LONG" else sw_hi
+        entry = sw_lo if side == "LONG" else sw_hi
         beyond = min(last[3], sw_lo) if side == "LONG" else max(last[2], sw_hi)
         dist = self._stop_dist(entry, atr, SFP_STOP_ATR, ctx["spread"])
         stop = beyond - dist if side == "LONG" else beyond + dist
@@ -1409,12 +1328,7 @@ class Signals:
             (ef[-1] > es[-1] and slope >= 0)
         if not conf:
             return None
-        off = TREND_B_ENTRY_OFF * atr
-        entry = mn_lo - off if side == "SHORT" else mn_hi + off
-        # защита: сдвинутая цена за рынком -> откат к классическому уровню
-        if (side == "SHORT" and entry >= last[4]) or \
-           (side == "LONG" and entry <= last[4]):
-            entry = mn_lo if side == "SHORT" else mn_hi
+        entry = mn_lo if side == "SHORT" else mn_hi   # ретест сломанного уровня
         beyond = last[2] if side == "SHORT" else last[3]
         dist = self._stop_dist(entry, atr, CHOCH_STOP_ATR, ctx["spread"])
         stop = beyond + dist if side == "SHORT" else beyond - dist
@@ -1499,7 +1413,6 @@ class Bot:
         self.stop_event = threading.Event()
         self.sig = Signals(api, tf_label, trend_label, ema_proximity_pct, self.log)
         self.positions = {}
-        self._orphans = {}   # символ: (oid, cid, попытки) — висящие ордера
         self.equity = DRY_RUN_BALANCE
         self.dry_balance = DRY_RUN_BALANCE
         self.day = dt.date.today()
@@ -1710,26 +1623,7 @@ class Bot:
                             f"{ft_.get('room', 0):.3f}", f"{ft_.get('align', 0):.3f}",
                             f"{ft_.get('cost', 0):.3f}"])
         except Exception as ex:
-            try:  # основная папка недоступна — сделка не должна потеряться
-                with open(SYS_TRADES_FILE, "a", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    ft_ = p.get("feats") or {}
-                    w.writerow([dt.datetime.now().isoformat(timespec="seconds"),
-                                symbol, p.get("kind"), p["side"], qstr(p["entry"]),
-                                qstr(p.get("stop0") or 0), qstr(p["risk"]),
-                                qstr(p.get("qty_total") or 0), qstr(p["tp_levels"][0]),
-                                qstr(p["tp_levels"][-1]), sum(p["tp_filled"]),
-                                qstr(cur) if cur is not None else "", category,
-                                f"{r_gross:.4f}", f"{r_net:.4f}", f"{usdt:.4f}",
-                                f"{fees:.4f}", f"{p.get('mae', 0):.3f}",
-                                f"{p.get('mfe', 0):.3f}", f"{p.get('score', 0):.3f}",
-                                int(bool(p.get("confluence"))),
-                                f"{ft_.get('vol_z', 0):.3f}", f"{ft_.get('depth', 0):.3f}",
-                                f"{ft_.get('room', 0):.3f}", f"{ft_.get('align', 0):.3f}",
-                                f"{ft_.get('cost', 0):.3f}"])
-                dbg(f"CSV: строка записана в системную копию ({ex})")
-            except Exception:
-                dbg(f"CSV trade write fail: {ex}")
+            dbg(f"CSV trade write fail: {ex}")
 
     # ---------- отбор сигналов ----------
     def _bar_t(self, symbol):
@@ -1843,40 +1737,6 @@ class Bot:
         except Exception:
             return None
 
-    def _entry_gone(self, symbol):
-        """True: входного ордера на бирже больше нет и позиции тоже нет —
-        ордер снят вручную или отозван биржей. Сбой API (None) -> False."""
-        try:
-            left = self.api.open_entry_orders(symbol)
-        except Exception:
-            return False
-        if left is None or left:
-            return False
-        try:
-            live = self.api.open_positions()
-        except Exception:
-            return False
-        if live is None or symbol in live:
-            return False
-        return True
-
-    def orphan_sweep(self):
-        """Повтор отмены висящих входных лимитов до подтверждения снятия."""
-        if DRY_RUN or not self._orphans:
-            return
-        for sym in list(self._orphans):
-            oid, cid, n = self._orphans[sym]
-            kind = self._do_cancel(sym, oid=oid or None,
-                                   cid=None if oid else (cid or None))
-            if kind == "gone":
-                del self._orphans[sym]
-                self.log(f"{sym}: висящий входной ордер снят ({oid or cid})")
-                continue
-            self._orphans[sym] = (oid, cid, n + 1)
-            if n + 1 in (5, 15, 30):
-                self.log(f"{sym}: ⚠️ висящий входной ордер {oid or cid} не снят "
-                         f"({kind}) — снимите вручную!")
-
     def _cancel_pending(self, symbol, p, why):
         p["cancel_fails"] = p.get("cancel_fails", 0) + 1
         n = p["cancel_fails"]
@@ -1977,21 +1837,6 @@ class Bot:
         s = sig["symbol"]
         if s in self.positions:
             return False
-        if not DRY_RUN:
-            live = self.api.open_positions()
-            if live and s in live:
-                self.log(f"{s}: на бирже позиция вне бота — перезапустите бот "
-                         f"для подхвата, вход отменён (no-dup)")
-                return False
-            left = self._entry_left(s)
-            if left:
-                for oid, cid in left:
-                    self._do_cancel(s, oid=oid or None,
-                                    cid=None if oid else (cid or None))
-                    self._orphans[s] = (oid, cid, 0)
-                self.log(f"{s}: на бирже висят входные лимиты ({len(left)}) — "
-                         f"снятие, вход отложен (no-dup)")
-                return False
         entry, risk = sig["entry"], sig["risk"]
         mult = sig["size_mult"]
         if sig.get("confluence"):
@@ -2003,14 +1848,6 @@ class Bot:
         if qty <= 0:
             self.log(f"{s}: объём {raw_qty:.6f} ниже минимума биржи — пропуск")
             return False
-        q = self.api.quote(s) or {}
-        now_px = _f(q.get("last"))
-        if now_px > 0:
-            if (sig["side"] == "SHORT" and now_px >= entry) or \
-               (sig["side"] == "LONG" and now_px <= entry):
-                self.log(f"{s}: цена уже за входом ({qstr(now_px)} против входа "
-                         f"{qstr(entry)}) — сигнал пропущен (no-chase)")
-                return False
         cid = new_client_id("sfp")
         oid = None
         if not DRY_RUN:
@@ -2226,14 +2063,6 @@ class Bot:
                 if info:
                     self.cancel_leftover_entry(symbol, p)
                     self._activate(symbol, p, info)
-                elif not DRY_RUN and time.time() - p.get("_gone_chk", 0) >= 30:
-                    # метка ставится до проверки: лимит не более раза в 30с,
-                    # даже если _entry_gone вернула False (ордер жив или сбой API)
-                    p["_gone_chk"] = time.time()
-                    if self._entry_gone(symbol):
-                        self.log(f"{symbol}: входной ордер исчез с биржи "
-                                 f"(снят вручную?) — слот освобождён")
-                        del self.positions[symbol]
                 elif time.time() > p["placed_ts"] + ENTRY_WAIT * self.tf_sec:
                     if self.cancel_entry_confirmed(symbol, p):
                         self.log(f"{symbol}: лимит не исполнен за {ENTRY_WAIT} "
@@ -2348,12 +2177,7 @@ class Bot:
             stop, _ = self.api.pending_exit_prices(sym)
             self.cleanup_orders(sym)
             for oid, cid in (self.api.open_entry_orders(sym) or []):
-                kind = self._do_cancel(sym, oid=oid or None,
-                                       cid=None if oid else (cid or None))
-                if kind != "gone":
-                    self._orphans[sym] = (oid, cid, 0)
-                    self.log(f"{sym}: ⚠️ входной ордер при подхвате не снят "
-                             f"({kind}) — повторю в цикле")
+                self._do_cancel(sym, oid=oid or None, cid=None if oid else (cid or None))
             if not stop or stop == entry:
                 stop = entry * (1 - 0.01) if side == "LONG" else entry * (1 + 0.01)
                 self.log(f"{sym}: биржевой стоп не найден — взят расчётный 1%")
@@ -2390,14 +2214,9 @@ class Bot:
             except Exception:
                 left = None
             for oid, cid in (left or []):
-                kind = self._do_cancel(sym, oid=oid or None,
-                                       cid=None if oid else (cid or None))
-                if kind == "gone":
+                if self._do_cancel(sym, oid=oid or None,
+                                   cid=None if oid else (cid or None)) == "gone":
                     self.log(f"{sym}: снят осиротевший входной ордер {oid or cid}")
-                else:
-                    self._orphans[sym] = (oid, cid, 0)
-                    self.log(f"{sym}: ⚠️ осиротевший входной ордер {oid or cid} "
-                             f"не снят ({kind}) — повторю в цикле")
         if self.positions:
             self.log(f"Восстановлено позиций: {len(self.positions)}")
 
@@ -2437,9 +2256,6 @@ class Bot:
                  f"{'вкл' if PREEMPT_ENABLED else 'выкл'} (порог x{PREEMPT_SCORE_RATIO}). "
                  f"Позиции каждые {FAST_PERIOD}с, сигналы на закрытии бара")
         self.log(MOSCOW_HINT)
-        self.log(f"Вариант 1 (ранний вход): TREND-A +{TREND_A_ENTRY_OFF} ATR, "
-                 f"TREND-B +{TREND_B_ENTRY_OFF} ATR, RANGE откат {RANGE_ENTRY_RETRACE:.2f}")
-        self.log(LOG_PATH_NOTE)
         if DRY_RUN:
             self.equity = self.dry_balance
             self.log(f"DRY-RUN: расчётный баланс {self.dry_balance:.0f} USDT")
@@ -2459,10 +2275,6 @@ class Bot:
                 self.manage_positions()
             except Exception as ex:
                 self.log(f"Ошибка сопровождения: {ex}\n{traceback.format_exc()}")
-            try:
-                self.orphan_sweep()
-            except Exception as ex:
-                self.log(f"Ошибка sweep: {ex}\n{traceback.format_exc()}")
             now_ms = int(time.time() * 1000)
             bar_id, into = now_ms // bar_ms, now_ms % bar_ms
             if bar_id != last_bar and into >= 5000:
@@ -2537,9 +2349,7 @@ def main(page: ft.Page):
               "DOTUSDT,SUIUSDT,APTUSDT,ARBUSDT,OPUSDT,JUPUSDT,FILUSDT,ATOMUSDT,"
               "XLMUSDT,HBARUSDT,INJUSDT,PEPEUSDT,WIFUSDT,TIAUSDT,SEIUSDT,SUSDT,"
               "ICPUSDT,ETCUSDT,BCHUSDT,POLUSDT,ALGOUSDT,VETUSDT,AAVEUSDT,CRVUSDT,"
-              "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT,"
-              "PENDLEUSDT,WLDUSDT,VIRTUALUSDT,KASUSDT,FARTCOINUSDT,DYDXUSDT,"
-              "ONDOUSDT,ARKMUSDT")
+              "LDOUSDT,GRTUSDT,FETUSDT,RENDERUSDT,TAOUSDT,ASTERUSDT,NIGHTUSDT,ENAUSDT")
     deposit = ft.TextField(label="Риск на сделку (0.010 = 1% компаунд от баланса)",
                            value=str(RISK_PCT_DEFAULT))
     losses = ft.TextField(label="Макс. стопов на корзину в день (на пару: 3)",
@@ -2582,39 +2392,19 @@ def main(page: ft.Page):
         add_log(msg, to_file=False)   # бот уже записал в файл
 
     def _export(src, name):
-        sys_src = SYS_LOG_FILE if "log" in name else SYS_TRADES_FILE
-        data = None
         try:
             with open(src, "r", encoding="utf-8") as f:
                 data = f.read()
         except Exception:
-            pass
-        if data is None:
-            try:  # основной файл недоступен — берём системную копию
-                with open(sys_src, "r", encoding="utf-8") as f:
-                    data = f.read()
-                add_log(f"{name}: взята системная копия {sys_src}")
-            except Exception:
-                pass
-        if data is None:
-            add_log(f"{name}: файл ещё не создан — запустите бота и повторите "
-                    f"(искал: {src} и {sys_src})")
+            add_log(f"{name}: файл не найден")
             return
-        if not data.strip():
-            add_log(f"{name}: файл создан при старте, но пуст — бот ещё не начал писать")
-            return
-        for base in ("/storage/emulated/0/Documents", "/sdcard/Documents",
-                     "/storage/emulated/0/Download", "/sdcard/Download",
-                     _DATA_DIR):
+        for base in ("/storage/emulated/0/Download", "/sdcard/Download",
+                     "/storage/emulated/0/Documents", _DATA_DIR):
             try:
                 dest = os.path.join(base, name)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(data)
-                if base == _DATA_DIR:
-                    add_log(f"{name}: общие папки недоступны (нет разрешения "
-                            f"на запись) — сохранено в системную: {dest}")
-                else:
-                    add_log(f"Сохранено: {dest}")
+                add_log(f"Сохранено: {dest}")
                 return
             except Exception:
                 continue
