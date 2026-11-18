@@ -26,11 +26,17 @@ jobs:
           channel: stable
           cache: true
 
-      # ✅ КЛЮЧЕВОЙ ШАГ: принимаем лицензии Android SDK
+      # ✅ Принять лицензии Android SDK
       - name: Accept Android licenses
         run: yes | flutter doctor --android-licenses || true
 
-      # ✅ Проверка (теперь будет зелёный)
+      # ✅ НОВЫЙ ШАГ: установить GTK-библиотеки
+      - name: Install GTK libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev mesa-utils
+
+      # ✅ Теперь flutter doctor будет зелёным
       - name: Flutter doctor
         run: flutter doctor -v
 
