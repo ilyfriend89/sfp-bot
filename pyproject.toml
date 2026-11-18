@@ -1,16 +1,12 @@
 [project]
-name = "bot-panel"
+name = "sfp-bot"
 version = "1.0.0"
+description = "SFP bot for BingX"
 dependencies = [
-    "flet",
+    "flet>=0.28.0",
+    "requests>=2.31.0",
 ]
 
 [tool.flet]
-org = "com.example"
-product = "ByBi Bot panel"
-
-[tool.flet.android]
-adaptive_icon_background = "#0f1a2b"
-
-[tool.flet.app]
-module = "main"
+org = "com.sfpbot.app"
+product = "ByBing Bot"
