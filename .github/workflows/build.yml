@@ -1,20 +1,60 @@
 name: build-apk
+
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      # 1. Код
+      - uses: actions/checkout@v4          # ← v5 не существует
+
+      # 2. Python
+      - uses: actions/setup-python@v5      # ← v6 не существует
+        with:
+          python-version: '3.12'
+
+      # 3. Java 17 (нужна для Android SDK и Flutter)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 4. Flutter
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.4'        # ← 3.47.9 ещё не вышел, актуальная 3.27.x
+          channel: stable
+          cache: true                       # ← ускоряет повторные сборки
+
+      # 5. Android SDK components (ОБЯЗАТЕЛЬНО — без них flutter doctor красный)
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      # 6. Flutter doctor — должен быть зелёным
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      # 7. Установка flet-cli (НЕ flet!) — это CLI для сборки APK
+      - name: Install flet-cli
+        run: pip install flet-cli
+
+      # 8. Сборка APK
       - name: Build APK
-        id: build
-        uses: flet-dev/flet-build-action@v1
+        run: flet build apk --verbose --arch arm64-v8a
+
+      # 9. Загрузка артефакта
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          target: apk
-          runner-python-version: "3.12"
-          bundled-python-version: "3.12"
-          build-number: ${{ github.run_number }}
-      - uses: actions/upload-artifact@v7
-        with:
-          path: ${{ steps.build.outputs.archive-path }}
-          if-no-files-found: error
+          name: bot-apk-arm64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          # ← правильный путь, а не build/apk/**/*.apk
