@@ -27,6 +27,26 @@ BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
 # ------------------- ПАПКА ДАННЫХ (Download/SFP_Bot) -------------------
+LOG_MAX = 200_000
+_LOG_PENDING = []   # записи, сделанные до выбора LOG_FILE — сбрасываются ниже
+
+def log_to_file(text):
+    """До инициализации LOG_FILE копит в буфер, после — пишет в файл."""
+    try:
+        path = globals().get("LOG_FILE")
+        if not path:
+            _LOG_PENDING.append(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}")
+            return
+        if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data[-LOG_MAX // 2:])
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
+    except Exception:
+        pass
+
 def _dir_writable(p):
     """Фактическая проба записи — os.access на Android врёт (scoped storage)."""
     try:
@@ -61,6 +81,7 @@ _DATA_DIR = _get_data_dir()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
+log_to_file(f"[DIR] итог: {_DATA_DIR}")
 LOG_MAX = 200_000
 DEBUG_API = True
 DRY_RUN = False
@@ -99,18 +120,18 @@ REGIME_THRESHOLD = 1.5
 HTF_BARS = 160
 WORK_BARS = 320
 
-# ------------------- ИЗДЕРЖКИ (ужесточено для защиты от комиссий) -------------------
+# ------------------- ИЗДЕРЖКИ (восстановлено по MIXED5, 18.11.2026) -------------------
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.0005
 COST_STOP_MULT = 10.0          
 MAX_SPREAD_PCT = 0.30          
 
-# ------------------- СХЕМЫ ВЫХОДОВ v5 (оптимизированы под 10-15% в месяц) -------------------
+# ------------------- СХЕМЫ ВЫХОДОВ (восстановлено по MIXED5, 18.11.2026; форвард-чек пройден) -------------------
 TP_TREND = [(1.5, 0.50), (3.0, 0.20)]  
 TREND_TAIL_SHARE = 0.30
 CHANDELIER_LOOKBACK = 22
 CHANDELIER_ATR = 3.0                   
-TREND_BE_AFTER_TP1 = 0.0               #  — после ТП1 стоп в +0.0R (гарантированная микро-прибыль)
+TREND_BE_AFTER_TP1 = 0.0               # после ТП1 стоп в безубыток (0.0R)
 
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
@@ -133,8 +154,8 @@ CHOCH_MINOR = 10
 CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70
 
-# ------------------- РИСК / ЛИМИТЫ (увеличены для роста) -------------------
-RISK_PCT_DEFAULT = 0.015               # БЫЛО 0.010 — 1.5% на сделку
+# ------------------- РИСК / ЛИМИТЫ (восстановлено по MIXED5, 18.11.2026) -------------------
+RISK_PCT_DEFAULT = 0.015               # 1.5% на сделку
 RISK_CAP_LEVERAGE = 5.0
 ENTRY_WAIT = 3
 FAST_PERIOD = 5
@@ -144,8 +165,8 @@ MAX_STOPS_BASKET = 5                   # - попыток в день
 DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.030                 # БЫЛО 0.025 — 4.0% суммарный риск
-MAX_SAME_DIR_RISK = 0.030              # БЫЛО 0.020 — 2.5% в одну сторону
+MAX_TOTAL_RISK = 0.030                 # 3.0% суммарный риск
+MAX_SAME_DIR_RISK = 0.030              # 3.0% в одну сторону
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
@@ -182,17 +203,6 @@ def cluster_of(symbol):
     return _CLUSTER_MAP.get(symbol, "OTHER")
 
 # ------------------- УТИЛИТЫ -------------------
-def log_to_file(text):
-    try:
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                data = f.read()
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.write(data[-LOG_MAX // 2:])
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{dt.datetime.now():%d.%m %H:%M:%S} | {text}\n")
-    except Exception:
-        pass
 
 def dbg(text):
     if DEBUG_API:
@@ -2312,6 +2322,17 @@ def main(page: ft.Page):
     page.title = "SFP-бот v5 CLEAN"
     page.padding = 48
 
+    # миграция: если файл состояния пуст, а в Download он есть — переносим
+    if not os.path.exists(STATE_FILE):
+        _old = os.path.join("/storage/emulated/0/Download", "SFP_Bot", "sfp_state.json")
+        if os.path.exists(_old):
+            try:
+                with open(_old, "r", encoding="utf-8") as _f:
+                    state_save(json.load(_f))
+                log_to_file(f"[MIGRATE] состояние перенесено из {_old}")
+            except Exception as _ex:
+                log_to_file(f"[MIGRATE] не удалось: {_ex}")
+
     def load_profiles():
         return state_load().get("profiles") or {}
     def save_profiles(p):
@@ -2440,8 +2461,8 @@ def main(page: ft.Page):
             add_log("Введите имя профиля")
             return
         profiles[name] = collect()
-        save_profiles(profiles)
         d = state_load()
+        d["profiles"] = profiles
         d["last_profile"] = name
         state_save(d)
         refresh_dd(name)
@@ -2465,7 +2486,9 @@ def main(page: ft.Page):
             add_log("Выберите профиль для удаления")
             return
         del profiles[name]
-        save_profiles(profiles)
+        d = state_load()
+        d["profiles"] = profiles
+        state_save(d)
         refresh_dd()
         add_log(f"Профиль «{name}» удалён")
 
@@ -2541,6 +2564,9 @@ def main(page: ft.Page):
         state["thread"].start()
         status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
         set_buttons(True)
+        d = state_load()
+        d["last_form"] = collect()
+        state_save(d)
 
     def on_stop(e):
         if state["bot"]:
@@ -2591,12 +2617,29 @@ def main(page: ft.Page):
                         ft.Row([btn_tab_settings, btn_tab_log]), content],
                        spacing=10, expand=True))
 
-    try:
-        last = state_load().get("last_profile")
-        if last and last in profiles:
+    st = state_load()
+    log_to_file(f"[START] file={STATE_FILE} exists={os.path.exists(STATE_FILE)} "
+                f"profiles={list((st.get('profiles') or {}).keys())} "
+                f"last={st.get('last_profile')}")
+    last = st.get("last_profile")
+    if not last and profiles:
+        last = sorted(profiles)[0]          # запасной путь: грузим первый профиль
+    if last and last in profiles:
+        try:
             apply(profiles[last])
             refresh_dd(last)
-    except Exception:
-        pass
+            log_to_file(f"[START] профиль «{last}» загружен")
+        except Exception as ex:
+            log_to_file(f"[START] apply() упал: {ex}")
+    else:
+        lf = st.get("last_form") or {}
+        if lf:
+            try:
+                apply(lf)
+                log_to_file("[START] применены последние настройки (last_form)")
+            except Exception as ex2:
+                log_to_file(f"[START] apply(last_form) упал: {ex2}")
+        else:
+            log_to_file("[START] профиль НЕ загружен: нет last_profile и нет профилей")
 
 ft.run(main)
