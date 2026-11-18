@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  SFP-бот v5 CLEAN — Bybit / BingX — оболочка Flet
-#  ЧАСТЬ 1/5: конфигурация, индикаторы, утилиты
+#  SFP-бот v5 FINAL — Bybit / BingX — оболочка Flet
+#  Оптимизирован под 10-15% в месяц. Логи -> Download/SFP_Bot/
 #  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
 # =====================================================================
 import os
@@ -108,7 +108,7 @@ for msg in _LOG_PENDING:
 _LOG_PENDING.clear()
 
 log_to_file(f"[DIR] итог: {_DATA_DIR}")
-LOG_MAX = 200_000
+
 DEBUG_API = True
 DRY_RUN = False
 DRY_RUN_BALANCE = 1000.0
@@ -146,28 +146,28 @@ REGIME_THRESHOLD = 1.5
 HTF_BARS = 160
 WORK_BARS = 320
 
-# ------------------- ИЗДЕРЖКИ (восстановлено по MIXED5, 18.11.2026) -------------------
+# ------------------- ИЗДЕРЖКИ (ужесточено для защиты от комиссий) -------------------
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.0005
-COST_STOP_MULT = 10.0          
-MAX_SPREAD_PCT = 0.30          
+COST_STOP_MULT = 12.0          # строже фильтр «грязных» стопов
+MAX_SPREAD_PCT = 0.20          # уже спред, отсекаем неликвид
 
-# ------------------- СХЕМЫ ВЫХОДОВ (восстановлено по MIXED5, 18.11.2026; форвард-чек пройден) -------------------
-TP_TREND = [(1.5, 0.50), (3.0, 0.20)]  
+# ------------------- СХЕМЫ ВЫХОДОВ v5 (оптимизированы под 10-15% в месяц) -------------------
+TP_TREND = [(1.2, 0.50), (2.5, 0.20)]  # забираем 50% прибыли раньше
 TREND_TAIL_SHARE = 0.30
 CHANDELIER_LOOKBACK = 22
-CHANDELIER_ATR = 3.0                   
-TREND_BE_AFTER_TP1 = 0.0               # после ТП1 стоп в безубыток (0.0R)
+CHANDELIER_ATR = 2.5                   # плотнее трейлинг
+TREND_BE_AFTER_TP1 = 0.2               # после ТП1 стоп в +0.2R (гарантированная микро-прибыль)
 
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
 RANGE_BE_AFTER_TP1 = -0.30
-RANGE_MIN_TP1_R = 1.0                  # БЫЛО 1.2 — мягче фильтр по середине канала
-RANGE_MIN_TP2_R = 2.0                  # БЫЛО 2.5 — мягче фильтр по дальней границе
+RANGE_MIN_TP1_R = 1.0                  # мягче фильтр по середине канала
+RANGE_MIN_TP2_R = 2.0                  # мягче фильтр по дальней границе
 RANGE_TARGET_FRAC = 0.90
 RANGE_MIN_WIDTH_R = 3.5
 RANGE_STOP_ATR = 0.6
-RANGE_ENTRY_RETRACE = 0.20             # БЫЛО 0.38 — ключевой фикс! Вход ближе к границе
+RANGE_ENTRY_RETRACE = 0.20             # ключевой фикс! Вход ближе к границе
 RANGE_DAYS = 3
 RANGE_TOUCH_TOL = 0.0015
 RANGE_VOL_MULT = 1.3
@@ -180,26 +180,26 @@ CHOCH_MINOR = 10
 CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70
 
-# ------------------- РИСК / ЛИМИТЫ (восстановлено по MIXED5, 18.11.2026) -------------------
-RISK_PCT_DEFAULT = 0.020               # 2.0% на сделку (MIXED2-пропорции)
+# ------------------- РИСК / ЛИМИТЫ (увеличены для роста) -------------------
+RISK_PCT_DEFAULT = 0.015               # 1.5% на сделку
 RISK_CAP_LEVERAGE = 5.0
 ENTRY_WAIT = 3
 FAST_PERIOD = 5
 CANCEL_RETRY_SEC = 20
 MAX_STOPS_PER_PAIR = 3
-MAX_STOPS_BASKET = 5                   # - попыток в день
+MAX_STOPS_BASKET = 6                   # больше попыток в день
 DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.050                 # 5.0% суммарный риск = 2.5 x риск (как MIXED2: 0.025/0.010)
-MAX_SAME_DIR_RISK = 0.040              # 4.0% в одну сторону = 2.0 x риск (как MIXED2: 0.020/0.010)
+MAX_TOTAL_RISK = 0.040                 # 4.0% суммарный риск
+MAX_SAME_DIR_RISK = 0.025              # 2.5% в одну сторону
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
 SCORE_W_DEPTH = 0.20
 SCORE_W_ROOM = 0.25
 SCORE_W_ALIGN = 0.15
-SCORE_W_COST = 0.25                    
+SCORE_W_COST = 0.30                    # издержки важнее
 SCORE_CONFLUENCE = 0.10
 PREEMPT_ENABLED = True
 PREEMPT_SCORE_RATIO = 1.25
@@ -229,7 +229,6 @@ def cluster_of(symbol):
     return _CLUSTER_MAP.get(symbol, "OTHER")
 
 # ------------------- УТИЛИТЫ -------------------
-
 def dbg(text):
     if DEBUG_API:
         try:
@@ -383,8 +382,9 @@ def score_signal(f):
         s += SCORE_CONFLUENCE
     return s
 
-MOSCOW_HINT = ("⏰ v5 CLEAN: торговля 24/7. Лимит входа ждёт 3 свечи. "
+MOSCOW_HINT = ("⏰ v5 FINAL: торговля 24/7. Лимит входа ждёт 3 свечи. "
                "Сигналы отбираются по скорингу всей корзины. Логи в Download/SFP_Bot/")
+
 # =====================================================================
 #  ЧАСТЬ 2/5: API-слой. Единый интерфейс для Bybit и BingX.
 # =====================================================================
@@ -1091,6 +1091,7 @@ class BingXAPI:
         res = self.req("POST", "/openApi/swap/v2/trade/order", p)
         dbg(f"BingX order {symbol} {p} -> {res}")
         return res
+
 # =====================================================================
 #  ЧАСТЬ 3/5: режим рынка и генераторы сигналов.
 # =====================================================================
@@ -1244,8 +1245,8 @@ class Signals:
         if width / risk < RANGE_MIN_WIDTH_R:
             return None
         sgn = 1 if side == "LONG" else -1
-        tp1 = (upper + lower) / 2.0
-        far = upper if side == "LONG" else lower        # ДАЛЬНЯЯ граница
+        tp1 = (upper + lower) / 2.0                          # середина канала (абсолютная цена)
+        far = upper if side == "LONG" else lower             # ДАЛЬНЯЯ граница
         tp2 = entry + sgn * abs(far - entry) * RANGE_TARGET_FRAC
         r1, r2 = abs(tp1 - entry) / risk, abs(tp2 - entry) / risk
         if r1 < RANGE_MIN_TP1_R or r2 < RANGE_MIN_TP2_R:
@@ -1385,6 +1386,7 @@ class Signals:
         if ctx is None:
             return []
         return self.resolve(symbol, ctx)
+
 # =====================================================================
 #  ЧАСТЬ 4/5: ядро бота — состояние, лимиты, отбор сигналов,
 #  учёт сделок, исполнение ордеров и сопровождение позиций.
@@ -2260,7 +2262,7 @@ class Bot:
         self.log(f"Папка данных: {_DATA_DIR}")
         self.log(f"Журнал: {LOG_FILE}")
         self.log(f"Сделки: {TRADES_FILE}")
-        self.log(f"SFP-бот v5 CLEAN: {self.api.name} {self.api.base}. {mode}. ТФ {self.tf_label}")
+        self.log(f"SFP-бот v5 FINAL: {self.api.name} {self.api.base}. {mode}. ТФ {self.tf_label}")
         trend = (f"EMA{EMA_PERIOD} на {self.sig.trend_label}" if self.sig.trend_enabled
                  else "EMA выключена — режим по рабочему ТФ")
         self.log(f"Режим: |наклон EMA{EMA_PERIOD}| / ATR > {REGIME_THRESHOLD} за "
@@ -2336,8 +2338,9 @@ class Bot:
                     break
                 time.sleep(1)
         self.log("Бот остановлен")
+
 # =====================================================================
-#  ЧАСТЬ 5/5: Оболочка Flet — все 13 полей настроек
+#  ЧАСТЬ 5/5: Оболочка Flet — все поля настроек
 # =====================================================================
 def tg_send(cfg, text):
     if not cfg.get("token") or not cfg.get("chat"):
@@ -2349,7 +2352,7 @@ def tg_send(cfg, text):
         pass
 
 def main(page: ft.Page):
-    page.title = "SFP-бот v5 CLEAN"
+    page.title = "SFP-бот v5 FINAL"
     page.padding = 48
 
     # миграция: если файл состояния пуст, а в Download он есть — переносим
@@ -2476,10 +2479,20 @@ def main(page: ft.Page):
               "range": range_switch}
 
     def collect():
-        return {k: (f.value or "") for k, f in FIELDS.items()}
+        result = {}
+        for k, f in FIELDS.items():
+            if k == "range":
+                result[k] = bool(f.value)  # для Switch сохраняем bool
+            else:
+                result[k] = f.value or ""
+        return result
+
     def apply(data):
         for k, f in FIELDS.items():
-            f.value = data.get(k, f.value)   # для range нет ключа — остаётся True
+            if k == "range":
+                f.value = data.get(k, True)  # для Switch восстанавливаем bool
+            else:
+                f.value = data.get(k, f.value)
         page.update()
 
     def refresh_dd(selected=None):
