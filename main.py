@@ -2489,21 +2489,21 @@ def main(page: ft.Page):
         page.update()
 
     def on_save(e):
-    name = profile_name.value.strip() or profile_dd.value
-    if not name:
-        add_log("Введите имя профиля")
-        return
-    profiles[name] = collect()
-    d = state_load()
-    d["profiles"] = profiles
-    d["last_profile"] = name
-    ok = state_save(d)
-    refresh_dd(name)
-    profile_name.value = ""
-    if ok:
-        add_log(f"Профиль «{name}» сохранён")
-    else:
-        add_log(f"Профиль «{name}» НЕ сохранён — ошибка записи в {STATE_FILE}")
+        name = profile_name.value.strip() or profile_dd.value
+        if not name:
+            add_log("Введите имя профиля")
+            return
+        profiles[name] = collect()
+        d = state_load()
+        d["profiles"] = profiles
+        d["last_profile"] = name
+        ok = state_save(d)
+        refresh_dd(name)
+        profile_name.value = ""
+        if ok:
+            add_log(f"Профиль «{name}» сохранён")
+        else:
+            add_log(f"Профиль «{name}» НЕ сохранён — ошибка записи в {STATE_FILE}")
 
     def on_load(e):
         name = profile_dd.value
