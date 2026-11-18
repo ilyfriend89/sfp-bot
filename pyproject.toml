@@ -1,25 +1,16 @@
 [project]
-name = "sfp-bot"
-version = "1.1.0"
-description = "SFP bot for BingX"
-requires-python = ">=3.10"
+name = "bot-panel"
+version = "1.0.0"
 dependencies = [
-    "flet==1.1.2",
-    "flet-cli==1.1.2",
-    "requests>=2.31.0",
+    "flet",
 ]
 
 [tool.flet]
-org = "com.sfpbot.app"
-product = "ByBing Bot"
+org = "com.example"
+product = "ByBi Bot panel"
 
 [tool.flet.android]
-min_sdk_version = 26
+adaptive_icon_background = "#0f1a2b"
 
-[tool.flet.android.permission]
-"android.permission.INTERNET" = true
-"android.permission.WAKE_LOCK" = true
-"android.permission.FOREGROUND_SERVICE" = true
-"android.permission.FOREGROUND_SERVICE_SPECIAL_USE" = true
-"android.permission.POST_NOTIFICATIONS" = true
-"android.permission.RECEIVE_BOOT_COMPLETED" = true
+[tool.flet.app]
+module = "main"
