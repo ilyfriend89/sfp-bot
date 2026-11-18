@@ -1186,8 +1186,8 @@ class Signals:
             return None
         sgn = 1 if side == "LONG" else -1
         tp1 = entry + sgn * (upper + lower) / 2.0
-        opposite = lower if side == "LONG" else upper
-        tp2 = entry + sgn * abs(opposite - entry) * RANGE_TARGET_FRAC
+        far = upper if side == "LONG" else lower        # ДАЛЬНЯЯ граница
+        tp2 = entry + sgn * abs(far - entry) * RANGE_TARGET_FRAC
         r1, r2 = abs(tp1 - entry) / risk, abs(tp2 - entry) / risk
         if r1 < RANGE_MIN_TP1_R or r2 < RANGE_MIN_TP2_R:
             return None
@@ -1364,6 +1364,8 @@ class Bot:
         self.last_stat_hour = None
         self._acted = {}
         self._rej = {}
+        self._live_pos_ts = 0.0
+        self._live_pos_cache = None
 
     def _log_both(self, msg):
         log_to_file(msg)
@@ -1752,11 +1754,72 @@ class Bot:
                 self.log(f"{symbol}: ордер {oid or cid} не снят — "
                          f"{getattr(self.api, 'last_error', '')}")
 
+    def _live_positions_cached(self, ttl=5.0):
+        """Живые позиции биржи с коротким кэшем — чтобы не долбить API на каждый сигнал."""
+        now = time.time()
+        if now - self._live_pos_ts < ttl:
+            return self._live_pos_cache
+        try:
+            out = self.api.open_positions()
+        except Exception:
+            out = None
+        self._live_pos_ts, self._live_pos_cache = now, out
+        return out
+
+    def _entry_gone(self, symbol, p):
+        """True — входного ордера больше нет на бирже (снят вручную/исключён).
+        None-ответ API не считается пропажей: слот держится до подтверждения."""
+        left = self._entry_left(symbol)
+        if left is None:
+            p["_gone_chk"] = p.get("_gone_chk", 0) + 1
+            if p["_gone_chk"] % 10 == 3:
+                self.log(f"{symbol}: список ордеров недоступен x{p['_gone_chk']} — слот держится")
+            return False
+        p["_gone_chk"] = 0
+        return len(left) == 0
+
+    def orphan_sweep(self):
+        """Периодическая чистка входных ордеров на парах без отслеживаемой позиции."""
+        if DRY_RUN:
+            return
+        for s in self.symbols:
+            if self.stop_event.is_set():
+                return
+            if s in self.positions:
+                continue
+            left = self._entry_left(s)
+            if not left:
+                continue
+            for oid, cid in left:
+                if self._do_cancel(s, oid=oid or None,
+                                   cid=None if oid else (cid or None)) == "gone":
+                    self.log(f"{s}: снят осиротевший входной ордер {oid or cid}")
+
     def try_enter(self, sig):
         s = sig["symbol"]
         if s in self.positions:
             return False
         entry, risk = sig["entry"], sig["risk"]
+        # --- no-dup: на бирже не должно быть позиции, которую бот не ведёт ---
+        if not DRY_RUN:
+            live_chk = self._live_positions_cached()
+            if live_chk is None:
+                self.log(f"{s}: список позиций недоступен — вход пропущен (no-dup fail-safe)")
+                return False
+            if s in live_chk:
+                self.log(f"{s}: на бирже уже есть позиция вне бота — вход пропущен (no-dup)")
+                return False
+        # --- no-chase: не ставить лимит, если цена уже за входом ---
+        try:
+            q = self.api.quote(s)
+        except Exception:
+            q = None
+        cur = (q or {}).get("last")
+        if cur:
+            if (cur - entry) * _sgn(sig["side"]) < 0:
+                self.log(f"{s}: цена {qstr(cur)} уже за входом {qstr(entry)} — "
+                         f"вход отменён (no-chase)")
+                return False
         mult = sig["size_mult"]
         if sig.get("confluence"):
             mult *= CONFLUENCE_SIZE_MULT
@@ -1983,6 +2046,16 @@ class Bot:
                     else:
                         p["placed_ts"] = (time.time() - ENTRY_WAIT * self.tf_sec
                                           + CANCEL_RETRY_SEC)
+                elif self._entry_gone(symbol, p):
+                    live2 = self.api.open_positions()
+                    if live2 is not None and symbol in live2:
+                        # гонка: ордер исполнился между двумя запросами — активирую
+                        self.cancel_leftover_entry(symbol, p)
+                        self._activate(symbol, p, live2[symbol])
+                    else:
+                        self.log(f"{symbol}: входной ордер исчез с биржи (снят вручную?) — "
+                                 f"слот освобождён")
+                        del self.positions[symbol]
                 continue
             info = live.get(symbol) if live is not None else None
             if info is None:
@@ -2188,6 +2261,10 @@ class Bot:
                     self.log(f"Ошибка отбора: {ex}\n{traceback.format_exc()}")
             if time.time() - last_status > 300:
                 last_status = time.time()
+                try:
+                    self.orphan_sweep()
+                except Exception as ex:
+                    dbg(f"orphan_sweep fail: {ex}")
                 tot, lr, sr = self.open_risk()
                 self.log(f"Статус: позиций {len(self.positions)}/{self.max_positions}, "
                          f"риск {tot * 100:.2f}% (L {lr * 100:.2f}% / S {sr * 100:.2f}%), "
