@@ -573,6 +573,7 @@ class BybitAPI:
 
     def all_open_orders(self, symbol):
         out, ok = [], False
+        want = self.sym(symbol).upper()
         for filt in ("Order", "StopOrder"):
             try:
                 d = self.req("GET", "/v5/order/realtime",
@@ -583,7 +584,7 @@ class BybitAPI:
                 self.last_error = str(ex)
                 continue
             for o in (d or {}).get("list", []):
-                if isinstance(o, dict):
+                if isinstance(o, dict) and str(o.get("symbol", "")).upper() == want:
                     out.append(o)
         return out if ok else None
 
@@ -944,7 +945,9 @@ class BingXAPI:
         except Exception as ex:
             self.last_error = str(ex)
             return None
-        return [o for o in self._unwrap(d) if isinstance(o, dict)]
+        want = self.fmt(symbol).upper()
+        return [o for o in self._unwrap(d) if isinstance(o, dict)
+                and str(o.get("symbol", "")).upper() == want]
 
     def open_reduce_orders(self, symbol):
         res = []
@@ -1185,7 +1188,7 @@ class Signals:
         if width / risk < RANGE_MIN_WIDTH_R:
             return None
         sgn = 1 if side == "LONG" else -1
-        tp1 = entry + sgn * (upper + lower) / 2.0
+        tp1 = (upper + lower) / 2.0
         far = upper if side == "LONG" else lower        # ДАЛЬНЯЯ граница
         tp2 = entry + sgn * abs(far - entry) * RANGE_TARGET_FRAC
         r1, r2 = abs(tp1 - entry) / risk, abs(tp2 - entry) / risk
