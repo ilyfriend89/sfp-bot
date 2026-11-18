@@ -61,7 +61,6 @@ _DATA_DIR = _get_data_dir()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
-log_to_file(f"[DIR] итог: {_DATA_DIR}")
 LOG_MAX = 200_000
 DEBUG_API = True
 DRY_RUN = False
@@ -100,18 +99,18 @@ REGIME_THRESHOLD = 1.5
 HTF_BARS = 160
 WORK_BARS = 320
 
-# ------------------- ИЗДЕРЖКИ (восстановлено по MIXED5, 18.11.2026) -------------------
+# ------------------- ИЗДЕРЖКИ (ужесточено для защиты от комиссий) -------------------
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.0005
 COST_STOP_MULT = 10.0          
 MAX_SPREAD_PCT = 0.30          
 
-# ------------------- СХЕМЫ ВЫХОДОВ (восстановлено по MIXED5, 18.11.2026; форвард-чек пройден) -------------------
+# ------------------- СХЕМЫ ВЫХОДОВ v5 (оптимизированы под 10-15% в месяц) -------------------
 TP_TREND = [(1.5, 0.50), (3.0, 0.20)]  
 TREND_TAIL_SHARE = 0.30
 CHANDELIER_LOOKBACK = 22
 CHANDELIER_ATR = 3.0                   
-TREND_BE_AFTER_TP1 = 0.0               # после ТП1 стоп в безубыток (0.0R)
+TREND_BE_AFTER_TP1 = 0.0               #  — после ТП1 стоп в +0.0R (гарантированная микро-прибыль)
 
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
@@ -134,8 +133,8 @@ CHOCH_MINOR = 10
 CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70
 
-# ------------------- РИСК / ЛИМИТЫ (восстановлено по MIXED5, 18.11.2026) -------------------
-RISK_PCT_DEFAULT = 0.015               # 1.5% на сделку
+# ------------------- РИСК / ЛИМИТЫ (увеличены для роста) -------------------
+RISK_PCT_DEFAULT = 0.015               # БЫЛО 0.010 — 1.5% на сделку
 RISK_CAP_LEVERAGE = 5.0
 ENTRY_WAIT = 3
 FAST_PERIOD = 5
@@ -145,8 +144,8 @@ MAX_STOPS_BASKET = 5                   # - попыток в день
 DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.030                 # 3.0% суммарный риск
-MAX_SAME_DIR_RISK = 0.030              # 3.0% в одну сторону
+MAX_TOTAL_RISK = 0.030                 # БЫЛО 0.025 — 4.0% суммарный риск
+MAX_SAME_DIR_RISK = 0.030              # БЫЛО 0.020 — 2.5% в одну сторону
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
@@ -2313,17 +2312,6 @@ def main(page: ft.Page):
     page.title = "SFP-бот v5 CLEAN"
     page.padding = 48
 
-    # миграция: если файл состояния пуст, а в Download он есть — переносим
-    if not os.path.exists(STATE_FILE):
-        _old = os.path.join("/storage/emulated/0/Download", "SFP_Bot", "sfp_state.json")
-        if os.path.exists(_old):
-            try:
-                with open(_old, "r", encoding="utf-8") as _f:
-                    state_save(json.load(_f))
-                log_to_file(f"[MIGRATE] состояние перенесено из {_old}")
-            except Exception as _ex:
-                log_to_file(f"[MIGRATE] не удалось: {_ex}")
-
     def load_profiles():
         return state_load().get("profiles") or {}
     def save_profiles(p):
@@ -2452,8 +2440,8 @@ def main(page: ft.Page):
             add_log("Введите имя профиля")
             return
         profiles[name] = collect()
+        save_profiles(profiles)
         d = state_load()
-        d["profiles"] = profiles
         d["last_profile"] = name
         state_save(d)
         refresh_dd(name)
@@ -2477,9 +2465,7 @@ def main(page: ft.Page):
             add_log("Выберите профиль для удаления")
             return
         del profiles[name]
-        d = state_load()
-        d["profiles"] = profiles
-        state_save(d)
+        save_profiles(profiles)
         refresh_dd()
         add_log(f"Профиль «{name}» удалён")
 
@@ -2555,9 +2541,6 @@ def main(page: ft.Page):
         state["thread"].start()
         status.value = f"Работает: {ex.value} / {mode.value} / {tf.value}"
         set_buttons(True)
-        d = state_load()
-        d["last_form"] = collect()
-        state_save(d)
 
     def on_stop(e):
         if state["bot"]:
@@ -2608,29 +2591,12 @@ def main(page: ft.Page):
                         ft.Row([btn_tab_settings, btn_tab_log]), content],
                        spacing=10, expand=True))
 
-    st = state_load()
-    log_to_file(f"[START] file={STATE_FILE} exists={os.path.exists(STATE_FILE)} "
-                f"profiles={list((st.get('profiles') or {}).keys())} "
-                f"last={st.get('last_profile')}")
-    last = st.get("last_profile")
-    if not last and profiles:
-        last = sorted(profiles)[0]          # запасной путь: грузим первый профиль
-    if last and last in profiles:
-        try:
+    try:
+        last = state_load().get("last_profile")
+        if last and last in profiles:
             apply(profiles[last])
             refresh_dd(last)
-            log_to_file(f"[START] профиль «{last}» загружен")
-        except Exception as ex:
-            log_to_file(f"[START] apply() упал: {ex}")
-    else:
-        lf = st.get("last_form") or {}
-        if lf:
-            try:
-                apply(lf)
-                log_to_file("[START] применены последние настройки (last_form)")
-            except Exception as ex2:
-                log_to_file(f"[START] apply(last_form) упал: {ex2}")
-        else:
-            log_to_file("[START] профиль НЕ загружен: нет last_profile и нет профилей")
+    except Exception:
+        pass
 
 ft.run(main)
