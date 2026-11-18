@@ -2500,4 +2500,4 @@ def main(page: ft.Page):
     except Exception:
         pass
 
-ft.run(main)      
+ft.run(main)
