@@ -2488,7 +2488,7 @@ def main(page: ft.Page):
             (sorted(profiles)[0] if profiles else None)
         page.update()
 
-    ef on_save(e):
+    def on_save(e):
     name = profile_name.value.strip() or profile_dd.value
     if not name:
         add_log("Введите имя профиля")
