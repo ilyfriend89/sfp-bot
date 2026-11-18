@@ -17,6 +17,8 @@ jobs:
         with:
           flutter-version: '3.47.9'
           channel: stable
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
       - name: GTK-библиотеки для flutter doctor
         run: |
           sudo apt-get update
