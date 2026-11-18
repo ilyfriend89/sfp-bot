@@ -62,25 +62,51 @@ def _get_data_dir():
     """Папка для логов, сделок, состояния. Выбор — по фактической записи."""
     for p in ("/storage/emulated/0/Download", "/sdcard/Download",
               os.path.expanduser("~/Downloads"), os.path.expanduser("~/Загрузки")):
-        if os.path.isdir(p) and _dir_writable(p):
-            sub = os.path.join(p, "SFP_Bot")
-            try:
-                os.makedirs(sub, exist_ok=True)
-                if _dir_writable(sub):
-                    log_to_file(f"[DIR] выбран путь: {sub}")
-                    return sub
-            except Exception:
-                continue
+        if not os.path.isdir(p):
+            _LOG_PENDING.append(f"[DIR] {p} не существует")
+            continue
+        if not _dir_writable(p):
+            _LOG_PENDING.append(f"[DIR] {p} недоступен для записи")
+            continue
+        sub = os.path.join(p, "SFP_Bot")
+        try:
+            os.makedirs(sub, exist_ok=True)
+            if _dir_writable(sub):
+                _LOG_PENDING.append(f"[DIR] выбран путь: {sub}")
+                return sub
+            else:
+                _LOG_PENDING.append(f"[DIR] {sub} недоступен для записи")
+        except Exception as ex:
+            _LOG_PENDING.append(f"[DIR] ошибка создания {sub}: {ex}")
+            continue
     base = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
     sub = os.path.join(base, "SFP_Bot")
-    os.makedirs(sub, exist_ok=True)
-    log_to_file(f"[DIR] Download недоступен, запасной путь: {sub}")
+    try:
+        os.makedirs(sub, exist_ok=True)
+        _LOG_PENDING.append(f"[DIR] Download недоступен, запасной путь: {sub}")
+    except Exception as ex:
+        _LOG_PENDING.append(f"[DIR] ошибка создания {sub}: {ex}")
     return sub
 
 _DATA_DIR = _get_data_dir()
 STATE_FILE = os.path.join(_DATA_DIR, "sfp_state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "sfp_log.txt")
 TRADES_FILE = os.path.join(_DATA_DIR, "sfp_trades.csv")
+
+# Сброс буфера логов
+for msg in _LOG_PENDING:
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(data[-LOG_MAX // 2:])
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+_LOG_PENDING.clear()
+
 log_to_file(f"[DIR] итог: {_DATA_DIR}")
 LOG_MAX = 200_000
 DEBUG_API = True
@@ -155,7 +181,7 @@ CHOCH_STOP_ATR = 0.6
 CHOCH_COUNTER_SIZE = 0.70
 
 # ------------------- РИСК / ЛИМИТЫ (восстановлено по MIXED5, 18.11.2026) -------------------
-RISK_PCT_DEFAULT = 0.015               # 1.5% на сделку
+RISK_PCT_DEFAULT = 0.020               # 2.0% на сделку (MIXED2-пропорции)
 RISK_CAP_LEVERAGE = 5.0
 ENTRY_WAIT = 3
 FAST_PERIOD = 5
@@ -165,8 +191,8 @@ MAX_STOPS_BASKET = 5                   # - попыток в день
 DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.030                 # 3.0% суммарный риск
-MAX_SAME_DIR_RISK = 0.030              # 3.0% в одну сторону
+MAX_TOTAL_RISK = 0.050                 # 5.0% суммарный риск = 2.5 x риск (как MIXED2: 0.025/0.010)
+MAX_SAME_DIR_RISK = 0.040              # 4.0% в одну сторону = 2.0 x риск (как MIXED2: 0.020/0.010)
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
@@ -1080,6 +1106,7 @@ class Signals:
         key = ("interval_bybit" if api.name == "Bybit" else "interval_bingx")
         self.trend_interval = TIMEFRAMES[trend_label][key] if self.trend_enabled else None
         self.range_bars = max(30, RANGE_DAYS * 1440 // TF_MINUTES[tf_label])
+        self.range_on = True   # переключается кнопкой RANGE в настройках
         self._ctx = {}
         self._diag = {}
 
@@ -1324,7 +1351,7 @@ class Signals:
                         f"CHoCH {CHOCH_SWING}, против режима={counter}")
 
     def resolve(self, symbol, ctx):
-        r = self.range_v5(symbol, ctx)
+        r = self.range_v5(symbol, ctx) if getattr(self, "range_on", True) else None
         a = self.trend_a(symbol, ctx)
         b = self.trend_b(symbol, ctx)
         d = ctx["regime"]["dir"]
@@ -2240,12 +2267,15 @@ class Bot:
                  f"{REGIME_LOOKBACK} бар = сильный тренд. {trend}")
         self.log(f"Пол стопа: stop >= {COST_STOP_MULT:.0f} x (maker+taker+спред); "
                  f"спред > {MAX_SPREAD_PCT}% — пара пропускается")
-        self.log(f"RANGE v5: канал {RANGE_DAYS} дн ({self.sig.range_bars} бар), "
-                 f"касания >={RANGE_MIN_TOUCHES}, объём x{RANGE_VOL_MULT} (работает), "
-                 f"вход {RANGE_ENTRY_RETRACE * 100:.0f}% отката, стоп {RANGE_STOP_ATR} ATR, "
-                 f"цели середина (>={RANGE_MIN_TP1_R}R) и дальняя граница "
-                 f"(>={RANGE_MIN_TP2_R}R), после ТП1 стоп {RANGE_BE_AFTER_TP1}R, "
-                 f"против режима не торгуем")
+        if getattr(self.sig, "range_on", True):
+            self.log(f"RANGE v5 (ВКЛ): канал {RANGE_DAYS} дн ({self.sig.range_bars} бар), "
+                     f"касания >={RANGE_MIN_TOUCHES}, объём x{RANGE_VOL_MULT}, "
+                     f"вход {RANGE_ENTRY_RETRACE * 100:.0f}% отката, стоп {RANGE_STOP_ATR} ATR, "
+                     f"цели середина (>={RANGE_MIN_TP1_R}R) и дальняя граница "
+                     f"(>={RANGE_MIN_TP2_R}R), после ТП1 стоп {RANGE_BE_AFTER_TP1}R, "
+                     f"против режима не торгуем")
+        else:
+            self.log("RANGE v5 (ВЫКЛ): модуль канала отключён кнопкой RANGE")
         self.log(f"TREND-A: свинг {SFP_SWING}, объём x{self.sig.vol_mult}, "
                  f"стоп {SFP_STOP_ATR} ATR. TREND-B: CHoCH {CHOCH_SWING} + слом "
                  f"{CHOCH_MINOR}, стоп {CHOCH_STOP_ATR} ATR, против режима "
@@ -2354,6 +2384,8 @@ def main(page: ft.Page):
                                                ft.dropdown.Option("Реальный")], value="Демо")
     tf = ft.Dropdown(label="Таймфрейм",
                      options=[ft.dropdown.Option(k) for k in TIMEFRAMES], value="15 минут")
+    range_switch = ft.Switch(label="RANGE", value=True,
+                             active_color=ft.Colors.GREEN_600)
     trend_tf = ft.Dropdown(label="Тренд-ТФ (EMA)",
                            options=[ft.dropdown.Option(EMA_OFF)] +
                                    [ft.dropdown.Option(k) for k in TIMEFRAMES], value="1 час")
@@ -2440,13 +2472,14 @@ def main(page: ft.Page):
     FIELDS = {"ex": ex, "mode": mode, "tf": tf, "trend_tf": trend_tf,
               "api_key": api_key, "secret": secret, "symbols": symbols,
               "deposit": deposit, "losses": losses, "maxpos": maxpos,
-              "ema_prox": ema_prox, "tg_token": tg_token, "tg_chat": tg_chat}
+              "ema_prox": ema_prox, "tg_token": tg_token, "tg_chat": tg_chat,
+              "range": range_switch}
 
     def collect():
         return {k: (f.value or "") for k, f in FIELDS.items()}
     def apply(data):
         for k, f in FIELDS.items():
-            f.value = data.get(k, "")
+            f.value = data.get(k, f.value)   # для range нет ключа — остаётся True
         page.update()
 
     def refresh_dd(selected=None):
@@ -2455,19 +2488,22 @@ def main(page: ft.Page):
             (sorted(profiles)[0] if profiles else None)
         page.update()
 
-    def on_save(e):
-        name = profile_name.value.strip() or profile_dd.value
-        if not name:
-            add_log("Введите имя профиля")
-            return
-        profiles[name] = collect()
-        d = state_load()
-        d["profiles"] = profiles
-        d["last_profile"] = name
-        state_save(d)
-        refresh_dd(name)
-        profile_name.value = ""
+    ef on_save(e):
+    name = profile_name.value.strip() or profile_dd.value
+    if not name:
+        add_log("Введите имя профиля")
+        return
+    profiles[name] = collect()
+    d = state_load()
+    d["profiles"] = profiles
+    d["last_profile"] = name
+    ok = state_save(d)
+    refresh_dd(name)
+    profile_name.value = ""
+    if ok:
         add_log(f"Профиль «{name}» сохранён")
+    else:
+        add_log(f"Профиль «{name}» НЕ сохранён — ошибка записи в {STATE_FILE}")
 
     def on_load(e):
         name = profile_dd.value
@@ -2557,6 +2593,7 @@ def main(page: ft.Page):
                            demo, tf_cfg["interval_bingx"])
         bot = Bot(api, tf.value, trend_tf.value, pairs, risk, n_loss, n_pos, bot_log,
                   ema_proximity_pct=prox, load_state=load_state, save_state=save_state)
+        bot.sig.range_on = range_switch.value
         cfg["token"] = tg_token.value.strip()
         cfg["chat"] = tg_chat.value.strip()
         state["bot"], state["active"] = bot, True
@@ -2567,6 +2604,14 @@ def main(page: ft.Page):
         d = state_load()
         d["last_form"] = collect()
         state_save(d)
+
+    def on_range_toggle(e):
+        b = state.get("bot")
+        if b and state.get("active"):
+            b.sig.range_on = range_switch.value
+            add_log(f"RANGE {'включён' if range_switch.value else 'выключен'} — действует сразу")
+
+    range_switch.on_change = on_range_toggle
 
     def on_stop(e):
         if state["bot"]:
@@ -2584,7 +2629,7 @@ def main(page: ft.Page):
         ft.Row([ft.FilledButton("Загрузить", on_click=on_load, expand=True),
                 ft.OutlinedButton("Удалить", on_click=on_delete, expand=True)]),
         ft.Divider(),
-        ex, mode, tf, trend_tf, api_key, secret, symbols,
+        ex, mode, ft.Row([tf, range_switch]), trend_tf, api_key, secret, symbols,
         ft.Row([ft.Container(deposit, expand=1), ft.Container(losses, expand=1)]),
         ft.Container(maxpos, expand=1), ema_prox, tg_token, tg_chat,
         dry_note, moscow_note, path_note,
