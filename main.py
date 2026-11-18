@@ -2,7 +2,6 @@
 # =====================================================================
 #  SFP-бот v5 CLEAN — Bybit / BingX — оболочка Flet
 #  ЧАСТЬ 1/5: конфигурация, индикаторы, утилиты
-#  Оптимизирован под 10-15% в месяц. Логи -> Download/SFP_Bot/
 #  ⚠️ ТОЛЬКО ИЗОЛИРОВАННАЯ МАРЖА (ISOLATED), ПЛЕЧО 5x В ПРИЛОЖЕНИИ БИРЖИ.
 # =====================================================================
 import os
@@ -28,21 +27,34 @@ BINGX_REAL = "https://open-api.bingx.com"
 BINGX_DEMO = "https://open-api-vst.bingx.com"
 
 # ------------------- ПАПКА ДАННЫХ (Download/SFP_Bot) -------------------
+def _dir_writable(p):
+    """Фактическая проба записи — os.access на Android врёт (scoped storage)."""
+    try:
+        probe = os.path.join(p, ".sfp_write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
 def _get_data_dir():
-    """Папка для логов, сделок, состояния. По умолчанию — Download/SFP_Bot."""
+    """Папка для логов, сделок, состояния. Выбор — по фактической записи."""
     for p in ("/storage/emulated/0/Download", "/sdcard/Download",
               os.path.expanduser("~/Downloads"), os.path.expanduser("~/Загрузки")):
-        if os.path.isdir(p) and os.access(p, os.W_OK):
+        if os.path.isdir(p) and _dir_writable(p):
             sub = os.path.join(p, "SFP_Bot")
             try:
                 os.makedirs(sub, exist_ok=True)
-                if os.access(sub, os.W_OK):
+                if _dir_writable(sub):
+                    log_to_file(f"[DIR] выбран путь: {sub}")
                     return sub
             except Exception:
                 continue
     base = os.getenv("FLET_APP_STORAGE_DATA") or os.getcwd()
     sub = os.path.join(base, "SFP_Bot")
     os.makedirs(sub, exist_ok=True)
+    log_to_file(f"[DIR] Download недоступен, запасной путь: {sub}")
     return sub
 
 _DATA_DIR = _get_data_dir()
@@ -90,15 +102,15 @@ WORK_BARS = 320
 # ------------------- ИЗДЕРЖКИ (ужесточено для защиты от комиссий) -------------------
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.0005
-COST_STOP_MULT = 12.0          # БЫЛО 10.0 — строже фильтр «грязных» стопов
-MAX_SPREAD_PCT = 0.20          # БЫЛО 0.30 — уже спред, отсекаем неликвид
+COST_STOP_MULT = 10.0          
+MAX_SPREAD_PCT = 0.30          
 
 # ------------------- СХЕМЫ ВЫХОДОВ v5 (оптимизированы под 10-15% в месяц) -------------------
-TP_TREND = [(1.2, 0.50), (2.5, 0.20)]  # БЫЛО 1.5/3.0 — забираем 50% прибыли раньше
+TP_TREND = [(1.5, 0.50), (3.0, 0.20)]  
 TREND_TAIL_SHARE = 0.30
 CHANDELIER_LOOKBACK = 22
-CHANDELIER_ATR = 2.5                   # БЫЛО 3.0 — плотнее трейлинг
-TREND_BE_AFTER_TP1 = 0.2               # БЫЛО 0.0 — после ТП1 стоп в +0.2R (гарантированная микро-прибыль)
+CHANDELIER_ATR = 3.0                   
+TREND_BE_AFTER_TP1 = 0.0               #  — после ТП1 стоп в +0.0R (гарантированная микро-прибыль)
 
 RANGE_TP1_SHARE = 0.50
 RANGE_TP2_SHARE = 0.50
@@ -128,19 +140,19 @@ ENTRY_WAIT = 3
 FAST_PERIOD = 5
 CANCEL_RETRY_SEC = 20
 MAX_STOPS_PER_PAIR = 3
-MAX_STOPS_BASKET = 6                   # БЫЛО 5 — больше попыток в день
+MAX_STOPS_BASKET = 5                   # - попыток в день
 DAILY_R_LIMIT = -4.0
 PAIR_COOLDOWN_HOURS = 4
 PAIR_COOLDOWN_STOPS = 2
-MAX_TOTAL_RISK = 0.040                 # БЫЛО 0.025 — 4.0% суммарный риск
-MAX_SAME_DIR_RISK = 0.025              # БЫЛО 0.020 — 2.5% в одну сторону
+MAX_TOTAL_RISK = 0.030                 # БЫЛО 0.025 — 4.0% суммарный риск
+MAX_SAME_DIR_RISK = 0.030              # БЫЛО 0.020 — 2.5% в одну сторону
 
 # ------------------- СКОРИНГ / ВЫТЕСНЕНИЕ -------------------
 SCORE_W_VOL = 0.30
 SCORE_W_DEPTH = 0.20
 SCORE_W_ROOM = 0.25
 SCORE_W_ALIGN = 0.15
-SCORE_W_COST = 0.30                    # БЫЛО 0.25 — издержки важнее
+SCORE_W_COST = 0.25                    
 SCORE_CONFLUENCE = 0.10
 PREEMPT_ENABLED = True
 PREEMPT_SCORE_RATIO = 1.25
@@ -193,15 +205,22 @@ def state_load():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as ex:
+        log_to_file(f"[LOAD FAILED] {ex} — файл битый? path={STATE_FILE}")
         return {}
 
 def state_save(data):
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-    except Exception:
-        pass
+        os.replace(tmp, STATE_FILE)   # атомарно: kill посреди записи не оставит битый файл
+        return True
+    except Exception as ex:
+        log_to_file(f"[SAVE FAILED] {ex} path={STATE_FILE}")
+        return False
 
 def round_step(value, step):
     try:
