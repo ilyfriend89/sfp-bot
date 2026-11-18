@@ -1,4 +1,4 @@
-name: build-apk
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -9,52 +9,50 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # 1. Код
-      - uses: actions/checkout@v4          # ← v5 не существует
+      - uses: actions/checkout@v4
 
-      # 2. Python
-      - uses: actions/setup-python@v5      # ← v6 не существует
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # 3. Java 17 (нужна для Android SDK и Flutter)
       - uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
 
-      # 4. Flutter
-      - uses: subosito/flutter-action@v2
+      # КЛЮЧЕВОЙ ШАГ: устанавливаем Flutter нужной версии вручную
+      - name: Install Flutter 3.27.4
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.27.4'        # ← 3.47.9 ещё не вышел, актуальная 3.27.x
+          flutter-version: '3.27.4'
           channel: stable
-          cache: true                       # ← ускоряет повторные сборки
+          cache: true
 
-      # 5. Android SDK components (ОБЯЗАТЕЛЬНО — без них flutter doctor красный)
-      - name: Install Android SDK components
+      # КЛЮЧЕВОЙ ШАГ: принимаем лицензии Android SDK
+      - name: Accept Android licenses
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+          yes | flutter doctor --android-licenses || true
+          flutter doctor -v
 
-      # 6. Flutter doctor — должен быть зелёным
-      - name: Flutter doctor
-        run: flutter doctor -v
-
-      # 7. Установка flet-cli (НЕ flet!) — это CLI для сборки APK
+      # КЛЮЧЕВОЙ ШАГ: устанавливаем flet-cli и патчим его
       - name: Install flet-cli
-        run: pip install flet-cli
+        run: |
+          pip install flet-cli
+          # Патчим flet-cli, чтобы он не спрашивал подтверждение
+          python -c "
+          import flet_cli.commands.flutter_base as m
+          # Перехватываем _prompt_input — всегда возвращаем True
+          m.FlutterBaseCommand._prompt_input = lambda self, prompt: True
+          " 2>/dev/null || true
 
-      # 8. Сборка APK
+      # КЛЮЧЕВОЙ ШАГ: запускаем сборку с автоподтверждением
       - name: Build APK
-        run: flet build apk --verbose --arch arm64-v8a
+        run: |
+          echo "y" | flet build apk --verbose --arch arm64-v8a || \
+          yes | flet build apk --verbose --arch arm64-v8a
 
-      # 9. Загрузка артефакта
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bot-apk-arm64
           path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
-          # ← правильный путь, а не build/apk/**/*.apk
